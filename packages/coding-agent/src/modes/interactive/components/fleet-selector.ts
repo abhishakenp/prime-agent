@@ -1,7 +1,7 @@
 /**
  * Interactive fleet selector — grouped device list with search.
  *
- * Visual design: grouped headers (FLEET/ONLINE/OFFLINE), checkboxes,
+ * Visual design: grouped headers (FLEET/ONLINE/OFFLINE),
  * OS badges, status badges, › cursor.
  *
  * Used in two contexts:
@@ -27,7 +27,6 @@ import { type DiscoveredDevice, discoverStream, inferTags } from "../../../cli/f
 import { type FleetHost, listFleetHosts } from "../../../cli/fleet/fleet-config.js";
 import {
 	addHostToFleet,
-	batchAddRemove,
 	bootstrapFleetHost,
 	checkFleetHostStatus,
 	connectFleetHost,
@@ -85,7 +84,6 @@ export class FleetSelectorComponent extends Container implements Focusable {
 	private filteredEntries: FleetEntry[] = [];
 	private selectedEntry: FleetEntry | null = null;
 	private cursorIndex = 0;
-	private checkedSet = new Set<string>();
 	private statusText = "";
 	private isLoading = false;
 	private _renaming = false;
@@ -279,9 +277,7 @@ export class FleetSelectorComponent extends Container implements Focusable {
 
 	private addDeviceRow(entry: FleetEntry, virtualIndex: number): void {
 		const isSelected = virtualIndex === this.cursorIndex;
-		const isChecked = this.checkedSet.has(entry.hostname);
 
-		const checkbox = isChecked ? theme.fg("success", "[✓]") : theme.fg("dim", "[ ]");
 		const displayName = entry.fleetHost?.displayName ?? entry.hostname;
 		const hostnameColor = entry.inFleet ? "accent" : entry.online ? "text" : "dim";
 		const hostname = theme.fg(hostnameColor, truncateToWidth(displayName, 22, ""));
@@ -289,8 +285,8 @@ export class FleetSelectorComponent extends Container implements Focusable {
 		const badges = this.formatBadges(entry);
 		const prefix = isSelected ? theme.fg("accent", "›") : " ";
 
-		const padding = " ".repeat(Math.max(1, 24 - visibleWidth(displayName)));
-		const row = `${prefix} ${checkbox} ${hostname}${padding}${osBadge} ${badges}`;
+		const padding = " ".repeat(Math.max(1, 27 - visibleWidth(displayName)));
+		const row = `${prefix} ${hostname}${padding}${osBadge} ${badges}`;
 		this.addChild(new Text(row, 1, 0));
 	}
 
@@ -486,9 +482,7 @@ export class FleetSelectorComponent extends Container implements Focusable {
 		const total = this.entries.length;
 		const online = this.entries.filter((e) => e.online).length;
 		const fleet = this.entries.filter((e) => e.inFleet).length;
-		const checked = this.checkedSet.size;
-		const checkInfo = checked > 0 ? theme.fg("accent", ` ${checked} selected`) : "";
-		return `${theme.fg("dim", `  ${total} devices · ${online} online · ${fleet} in fleet`)}${checkInfo}  ${theme.fg("dim", "Space select · Enter actions · / search · Ctrl+R rename · Ctrl+T tag · P runtimes · q quit")}`;
+		return `${theme.fg("dim", `  ${total} devices · ${online} online · ${fleet} in fleet`)}  ${theme.fg("dim", "Enter actions · / search · Ctrl+R rename · Ctrl+T tag · P runtimes · q quit")}`;
 	}
 
 	// ─── Keyboard ─────────────────────────────────────────────────────
@@ -604,19 +598,6 @@ export class FleetSelectorComponent extends Container implements Focusable {
 			return;
 		}
 
-		if (data === " ") {
-			const entry = this.filteredEntries[this.cursorIndex];
-			if (entry) {
-				if (this.checkedSet.has(entry.hostname)) {
-					this.checkedSet.delete(entry.hostname);
-				} else {
-					this.checkedSet.add(entry.hostname);
-				}
-				this.rebuildChildren();
-			}
-			return;
-		}
-
 		if (kb.matches(data, "tui.select.confirm")) {
 			void this.handleEnter();
 			return;
@@ -627,10 +608,6 @@ export class FleetSelectorComponent extends Container implements Focusable {
 	}
 
 	private async handleEnter(): Promise<void> {
-		if (this.checkedSet.size > 0) {
-			await this.batchAddRemove();
-			return;
-		}
 		const entry = this.filteredEntries[this.cursorIndex];
 		if (entry) {
 			this.currentView = "host-actions";
@@ -903,50 +880,6 @@ export class FleetSelectorComponent extends Container implements Focusable {
 	}
 
 	// ─── Actions — all delegate to fleet-operations.ts ────────────────
-
-	private async batchAddRemove(): Promise<void> {
-		const toAdd: {
-			hostname: string;
-			address: string;
-			tags?: string[];
-			device?: DiscoveredDevice;
-			sshable?: boolean;
-			piVersion?: string;
-			os?: string;
-		}[] = [];
-		const toRemove: string[] = [];
-
-		for (const hostname of this.checkedSet) {
-			const entry = this.entries.find((e) => e.hostname === hostname);
-			if (!entry) continue;
-			if (entry.inFleet) {
-				toRemove.push(hostname);
-			} else {
-				toAdd.push({
-					hostname: entry.hostname,
-					address: entry.address,
-					tags: entry.tags.length > 0 ? entry.tags : undefined,
-					device: entry.device,
-					sshable: entry.sshable,
-					piVersion: entry.piVersion,
-					os: entry.os,
-				});
-			}
-		}
-
-		this.checkedSet.clear();
-		if (toAdd.length === 0 && toRemove.length === 0) return;
-
-		this.setLoading(`Adding ${toAdd.length}, removing ${toRemove.length}...`);
-		const result = await batchAddRemove(toAdd, toRemove);
-		this.clearLoading();
-
-		const parts: string[] = [];
-		if (result.added.length > 0) parts.push(`added ${result.added.length}`);
-		if (result.removed.length > 0) parts.push(`removed ${result.removed.length}`);
-		this.statusText = `✓ ${parts.join(", ")}`;
-		await this.autoDiscover();
-	}
 
 	private async hostAction(action: string): Promise<void> {
 		const entry = this.selectedEntry;
