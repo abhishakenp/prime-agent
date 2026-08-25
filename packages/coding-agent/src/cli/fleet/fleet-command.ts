@@ -43,7 +43,7 @@ export async function handleFleetCommand(args: string[]): Promise<void> {
 
 	switch (subcommand) {
 		case undefined:
-			await interactiveFleet(rest);
+			await interactiveFleetTUI();
 			break;
 		case "list":
 			await listFleet(rest);
@@ -373,34 +373,7 @@ async function bootstrapHostCmd(args: string[]): Promise<void> {
 
 // ─── interactive TUI ───────────────────────────────────────────────
 
-async function interactiveFleet(_args: string[]): Promise<void> {
-	// Phase 1: print a summary and available actions
-	// Full TUI with arrow-key selection would use the same ink framework as `pi config`
-	const hosts = await listFleetHosts();
-
-	console.log(chalk.bold("\n  Prime Agent Fleet\n"));
-
-	if (hosts.length === 0) {
-		console.log(chalk.dim("  No hosts registered yet."));
-	} else {
-		console.log(`  ${"HOSTNAME".padEnd(20)} ${"ADDRESS".padEnd(20)} ${"TAGS".padEnd(15)} ${"STATUS"}`);
-		console.log(`  ${"─".repeat(20)} ${"─".repeat(20)} ${"─".repeat(15)} ${"─".repeat(10)}`);
-		for (const host of hosts) {
-			const status = host.lastStatus ?? "unknown";
-			const statusColor =
-				status === "connected" ? chalk.green : status === "disconnected" ? chalk.yellow : chalk.dim;
-			console.log(
-				`  ${host.hostname.padEnd(20)} ${host.address.padEnd(20)} ${host.tags.join(",").padEnd(15)} ${statusColor(status)}`,
-			);
-		}
-	}
-
-	console.log(chalk.cyan("\n  Actions:"));
-	console.log("    prime-agent fleet discover     Scan for networked devices");
-	console.log("    prime-agent fleet add <host>   Add a device to the fleet");
-	console.log("    prime-agent fleet bootstrap <host>  Install pi + start daemon");
-	console.log("    prime-agent fleet remove <host>  Remove from fleet");
-	console.log("    prime-agent fleet status <host>  Check host status");
-	console.log("    prime-agent fleet list         List all hosts (--json for JSON)");
-	console.log();
+async function interactiveFleetTUI(): Promise<void> {
+	const { selectFleetInteractive } = await import("../fleet-selector.js");
+	await selectFleetInteractive();
 }
