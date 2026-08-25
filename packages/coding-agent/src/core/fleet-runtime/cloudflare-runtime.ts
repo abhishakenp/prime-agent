@@ -12,8 +12,9 @@
  */
 
 import { spawn } from "node:child_process";
-import { readFileSync } from "node:fs";
-import { join } from "node:path";
+import { existsSync, mkdirSync, readFileSync, realpathSync, writeFileSync } from "node:fs";
+import { homedir } from "node:os";
+import { dirname, join } from "node:path";
 import { type AgentIdentitySpec, assembleBundle, type BundleSpec } from "./agent-bundle.js";
 import type {
 	AgentEvent,
@@ -29,6 +30,8 @@ import type {
 export interface CloudflareRuntimeConfig {
 	apiToken?: string;
 	accountId?: string;
+	/** workers.dev subdomain (e.g. "abhi-shake-np"). If absent, extracted from wrangler output. */
+	workersSubdomain?: string;
 	gatewayUrl?: string;
 	gatewayAuthToken?: string;
 }
@@ -95,6 +98,20 @@ export class CloudflareRuntime implements AgentRuntime {
 		// Deploy
 		const workerName = `prime-agent-${agentId.slice(0, 8)}`;
 		const status = await this.deployWorker(workerName, workerScript);
+
+		// Trigger the agent run — retry until the Worker is ready
+		if (status.deployed && status.url) {
+			for (let i = 0; i < 10; i++) {
+				try {
+					const resp = await fetch(`${status.url}/run`, { method: "POST" });
+					if (resp.ok) {
+						const data = (await resp.json()) as { status?: string };
+						if (data.status !== "pending") break;
+					}
+				} catch {}
+				await new Promise((r) => setTimeout(r, 2000));
+			}
+		}
 
 		let currentStatus: AgentStatusInfo = { status: "running" };
 		const eventListeners = new Set<(event: AgentEvent) => void>();
@@ -179,8 +196,8 @@ const ENV_VARS = ${envJson};
 const SETTINGS = ${settingsJson};
 
 // Agent state
-let agentStatus = "running";
-let startedAt = Date.now();
+let agentStatus = "pending";
+let startedAt = 0;
 
 export default {
   async fetch(request, env, ctx) {
@@ -195,7 +212,7 @@ export default {
         status: agentStatus,
         info: {
           status: agentStatus,
-          durationMs: Date.now() - startedAt,
+          durationMs: startedAt > 0 ? Date.now() - startedAt : 0,
         },
       });
     }
@@ -218,8 +235,12 @@ export default {
     }
 
     if (url.pathname === "/run" || url.pathname === "/") {
-      ctx.waitUntil(runAgent(env));
-      return Response.json({ agentId: AGENT_ID, status: "started" });
+      if (agentStatus === "pending") {
+        agentStatus = "running";
+        startedAt = Date.now();
+        ctx.waitUntil(runAgent(env));
+      }
+      return Response.json({ agentId: AGENT_ID, status: agentStatus });
     }
 
     return new Response("Prime Agent Worker", { status: 200 });
@@ -227,89 +248,92 @@ export default {
 };
 
 async function runAgent(env) {
-  if (!GATEWAY_URL) {
-    // No gateway — just mark as completed
-    agentStatus = "completed";
-    return;
-  }
+  // sendEvent works with or without gateway
+  let ws = null;
+  const sendEvent = (eventType, extra = {}) => {
+    if (ws) {
+      try {
+        ws.send(JSON.stringify({
+          id: crypto.randomUUID(),
+          type: "agent_event",
+          payload: {
+            agentId: AGENT_ID,
+            parentAgentId: PARENT_AGENT_ID,
+            eventType,
+            host: "cloudflare",
+            ...extra,
+          },
+          timestamp: Date.now(),
+        }));
+      } catch {}
+    }
+  };
 
-  try {
-    const ws = new WebSocket(GATEWAY_URL);
-    await new Promise((resolve, reject) => {
-      ws.addEventListener("open", resolve);
-      ws.addEventListener("error", reject);
-      setTimeout(reject, 5000);
-    });
+  // Connect to gateway if configured
+  if (GATEWAY_URL) {
+    try {
+      ws = new WebSocket(GATEWAY_URL);
+      await new Promise((resolve, reject) => {
+        ws.addEventListener("open", resolve);
+        ws.addEventListener("error", reject);
+        setTimeout(reject, 5000);
+      });
 
-    // Register as agent
-    ws.send(JSON.stringify({
-      id: crypto.randomUUID(),
-      type: "agent_register",
-      payload: {
-        agentId: AGENT_ID,
-        host: "cloudflare",
-        hardwareId: "cloudflare-worker",
-        sessionDir: "/tmp/agent",
-        model: MODEL,
-        label: AGENT_LABEL,
-        depth: AGENT_DEPTH,
-        parentAgentId: PARENT_AGENT_ID,
-        parentHost: PARENT_HOST,
-        tags: ["cloudflare", "ephemeral"],
-      },
-      timestamp: Date.now(),
-    }));
-
-    // Emit running status
-    const sendEvent = (eventType, extra = {}) => {
       ws.send(JSON.stringify({
         id: crypto.randomUUID(),
-        type: "agent_event",
+        type: "agent_register",
         payload: {
           agentId: AGENT_ID,
-          parentAgentId: PARENT_AGENT_ID,
-          eventType,
           host: "cloudflare",
-          ...extra,
+          hardwareId: "cloudflare-worker",
+          sessionDir: "/tmp/agent",
+          model: MODEL,
+          label: AGENT_LABEL,
+          depth: AGENT_DEPTH,
+          parentAgentId: PARENT_AGENT_ID,
+          parentHost: PARENT_HOST,
+          tags: ["cloudflare", "ephemeral"],
         },
         timestamp: Date.now(),
       }));
-    };
-
-    sendEvent("status", { status: "running" });
-    sendEvent("log", { content: "Agent started on Cloudflare Worker" });
-
-    // Call the LLM API using the included credentials
-    // The credentials are sealed inside the bundle (ENV_VARS)
-    const model = SETTINGS.defaultModel || MODEL;
-    const provider = SETTINGS.defaultProvider || "openrouter";
-
-    // Determine API endpoint and key from the bundled credentials
-    let apiUrl = null;
-    let apiKey = null;
-
-    if (provider === "openrouter" && ENV_VARS.OPENROUTER_API_KEY) {
-      apiUrl = "https://openrouter.ai/api/v1/chat/completions";
-      apiKey = ENV_VARS.OPENROUTER_API_KEY;
-    } else if (provider === "anthropic" && ENV_VARS.ANTHROPIC_API_KEY) {
-      apiUrl = "https://api.anthropic.com/v1/messages";
-      apiKey = ENV_VARS.ANTHROPIC_API_KEY;
-    } else if (provider === "openai" && ENV_VARS.OPENAI_API_KEY) {
-      apiUrl = "https://api.openai.com/v1/chat/completions";
-      apiKey = ENV_VARS.OPENAI_API_KEY;
-    } else if (provider === "gemini" && ENV_VARS.GEMINI_API_KEY) {
-      apiUrl = "https://generativelanguage.googleapis.com/v1beta/models/" + model + ":generateContent";
-      apiKey = ENV_VARS.GEMINI_API_KEY;
-    } else if (provider === "deepseek" && ENV_VARS.DEEPSEEK_API_KEY) {
-      apiUrl = "https://api.deepseek.com/v1/chat/completions";
-      apiKey = ENV_VARS.DEEPSEEK_API_KEY;
+    } catch {
+      ws = null; // Continue without gateway
     }
+  }
 
-    if (apiUrl && apiKey) {
-      sendEvent("log", { content: "Calling LLM: " + provider + "/" + model });
+  sendEvent("status", { status: "running" });
+  sendEvent("log", { content: "Agent started on Cloudflare Worker" });
 
-      // Make the LLM API call
-      const isGemini = provider === "gemini";
+  // Call the LLM API using the included credentials
+  const model = SETTINGS.defaultModel || MODEL;
+  const provider = SETTINGS.defaultProvider || "openrouter";
+
+  // Determine API endpoint and key from the bundled credentials
+  let apiUrl = null;
+  let apiKey = null;
+
+  if (provider === "openrouter" && ENV_VARS.OPENROUTER_API_KEY) {
+    apiUrl = "https://openrouter.ai/api/v1/chat/completions";
+    apiKey = ENV_VARS.OPENROUTER_API_KEY;
+  } else if (provider === "anthropic" && ENV_VARS.ANTHROPIC_API_KEY) {
+    apiUrl = "https://api.anthropic.com/v1/messages";
+    apiKey = ENV_VARS.ANTHROPIC_API_KEY;
+  } else if (provider === "openai" && ENV_VARS.OPENAI_API_KEY) {
+    apiUrl = "https://api.openai.com/v1/chat/completions";
+    apiKey = ENV_VARS.OPENAI_API_KEY;
+  } else if (provider === "gemini" && ENV_VARS.GEMINI_API_KEY) {
+    apiUrl = "https://generativelanguage.googleapis.com/v1beta/models/" + model + ":generateContent";
+    apiKey = ENV_VARS.GEMINI_API_KEY;
+  } else if (provider === "deepseek" && ENV_VARS.DEEPSEEK_API_KEY) {
+    apiUrl = "https://api.deepseek.com/v1/chat/completions";
+    apiKey = ENV_VARS.DEEPSEEK_API_KEY;
+  }
+
+  if (apiUrl && apiKey) {
+    sendEvent("log", { content: "Calling LLM: " + provider + "/" + model });
+
+    const isGemini = provider === "gemini";
+    try {
       const response = await fetch(apiUrl + (isGemini ? "?key=" + apiKey : ""), {
         method: "POST",
         headers: {
@@ -344,16 +368,18 @@ async function runAgent(env) {
         sendEvent("status", { status: "error", error: "LLM API error: " + response.status });
         agentStatus = "error";
       }
-    } else {
-      sendEvent("log", { content: "No LLM credentials found for provider: " + provider });
-      sendEvent("status", { status: "error", error: "No LLM credentials" });
+    } catch (err) {
+      sendEvent("log", { content: "LLM fetch error: " + err.message });
+      sendEvent("status", { status: "error", error: err.message });
       agentStatus = "error";
     }
-
-    ws.close();
-  } catch (err) {
+  } else {
+    sendEvent("log", { content: "No LLM credentials found for provider: " + provider });
+    sendEvent("status", { status: "error", error: "No LLM credentials" });
     agentStatus = "error";
   }
+
+  if (ws) try { ws.close(); } catch {}
 }
 `;
 	}
@@ -388,7 +414,19 @@ async function runAgent(env) {
 							body: JSON.stringify({ enabled: true }),
 						},
 					).catch(() => {});
-					return { deployed: true, url: `https://${name}.${accountId}.workers.dev` };
+					// Get the workers.dev subdomain for this account
+					let workersSubdomain = accountId;
+					try {
+						const subResp = await fetch(
+							`https://api.cloudflare.com/client/v4/accounts/${accountId}/workers/subdomain`,
+							{ headers: { Authorization: `Bearer ${apiToken}` } },
+						);
+						if (subResp.ok) {
+							const subData = (await subResp.json()) as { result?: { subdomain?: string } };
+							workersSubdomain = subData.result?.subdomain ?? accountId;
+						}
+					} catch {}
+					return { deployed: true, url: `https://${name}.${workersSubdomain}.workers.dev` };
 				}
 			} catch {}
 		}
@@ -397,10 +435,9 @@ async function runAgent(env) {
 		return new Promise((resolve) => {
 			const tmpDir = `/tmp/cf-worker-${name}`;
 			try {
-				const fs = require("node:fs");
-				fs.mkdirSync(tmpDir, { recursive: true });
-				fs.writeFileSync(join(tmpDir, "worker.js"), script);
-				fs.writeFileSync(
+				mkdirSync(tmpDir, { recursive: true });
+				writeFileSync(join(tmpDir, "worker.js"), script);
+				writeFileSync(
 					join(tmpDir, "wrangler.jsonc"),
 					JSON.stringify({
 						name,
@@ -411,7 +448,14 @@ async function runAgent(env) {
 				);
 			} catch {}
 
-			const wrangler = spawn("npx", ["wrangler", "deploy"], {
+			// Find npx-cli.js — npx is a symlink to a node script, can't spawn directly
+			const npxCliPath = findNpxCli();
+			// Resolve symlinks — spawn doesn't follow them on macOS
+			let nodePath = realpathSync(process.execPath);
+			if (!existsSync(nodePath)) nodePath = "/usr/local/bin/node";
+			if (!existsSync(nodePath)) nodePath = "node";
+			const wranglerArgs = npxCliPath ? [npxCliPath, "wrangler", "deploy"] : ["wrangler", "deploy"];
+			const wrangler = spawn(nodePath, wranglerArgs, {
 				cwd: tmpDir,
 				stdio: ["pipe", "pipe", "pipe"],
 				env: { ...process.env, CLOUDFLARE_API_TOKEN: apiToken ?? "", CLOUDFLARE_ACCOUNT_ID: accountId ?? "" },
@@ -419,11 +463,25 @@ async function runAgent(env) {
 			let output = "";
 			wrangler.stdout?.setEncoding("utf-8");
 			wrangler.stdout?.on("data", (d: string) => (output += d));
+			wrangler.stderr?.setEncoding("utf-8");
+			wrangler.stderr?.on("data", (d: string) => (output += d));
+			wrangler.on("error", (err) => {
+				console.error("wrangler spawn error:", err.message);
+				resolve({ deployed: false });
+			});
 			wrangler.on("exit", (code) => {
 				if (code === 0) {
+					// Try to extract URL from wrangler output first
 					const urlMatch = output.match(/https:\/\/[^\s]+\.workers\.dev/);
-					resolve({ deployed: true, url: urlMatch?.[0] });
+					if (urlMatch) {
+						resolve({ deployed: true, url: urlMatch[0] });
+					} else if (this.config.workersSubdomain) {
+						resolve({ deployed: true, url: `https://${name}.${this.config.workersSubdomain}.workers.dev` });
+					} else {
+						resolve({ deployed: true });
+					}
 				} else {
+					console.error("wrangler deploy failed:", output.slice(-500));
 					resolve({ deployed: false });
 				}
 			});
@@ -442,4 +500,33 @@ async function runAgent(env) {
 			} catch {}
 		}
 	}
+}
+
+/** Find npx-cli.js so we can spawn it via node directly. */
+function findNpxCli(): string | null {
+	// Check common npm locations
+	const candidates = [
+		"/opt/homebrew/lib/node_modules/npm/bin/npx-cli.js",
+		"/usr/local/lib/node_modules/npm/bin/npx-cli.js",
+		join(homedir(), ".npm-global/lib/node_modules/npm/bin/npx-cli.js"),
+		join(homedir(), ".nvm/versions/node", process.version, "lib/node_modules/npm/bin/npx-cli.js"),
+	];
+	for (const c of candidates) {
+		if (existsSync(c)) return c;
+	}
+	// Search PATH for npx, resolve symlink, find npx-cli.js relative to it
+	for (const dir of (process.env.PATH ?? "").split(":")) {
+		const npxPath = join(dir, "npx");
+		if (existsSync(npxPath)) {
+			try {
+				const real = realpathSync(npxPath);
+				const npmRoot = join(dirname(real), "..", "..", "lib", "node_modules", "npm", "bin", "npx-cli.js");
+				if (existsSync(npmRoot)) return npmRoot;
+				// Try relative to the symlink target
+				const cli = join(dirname(real), "npx-cli.js");
+				if (existsSync(cli)) return cli;
+			} catch {}
+		}
+	}
+	return null;
 }

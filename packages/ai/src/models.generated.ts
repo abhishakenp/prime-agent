@@ -15394,7 +15394,7 @@ export const MODELS = {
 			input: ["text"],
 			cost: {
 				input: 0.035,
-				output: 0.09999999999999999,
+				output: 0.12,
 				cacheRead: 0.008,
 				cacheWrite: 0,
 			},
@@ -15447,13 +15447,13 @@ export const MODELS = {
 			thinkingLevelMap: {"minimal":null,"low":"low","medium":null,"high":"high","xhigh":null,"max":"max"},
 			input: ["text", "image"],
 			cost: {
-				input: 2.6,
-				output: 13,
-				cacheRead: 0.29,
+				input: 2.5500000000000003,
+				output: 12.75,
+				cacheRead: 0.25599998999999996,
 				cacheWrite: 0,
 			},
 			contextWindow: 1048576,
-			maxTokens: 877357,
+			maxTokens: 943718,
 		} satisfies Model<"openai-completions">,
 		"~openai/gpt-latest": {
 			id: "~openai/gpt-latest",

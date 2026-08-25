@@ -11,6 +11,7 @@
  * The target (GH Actions) needs nothing — the bundle IS the workflow.
  */
 
+import { execSync } from "node:child_process";
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
 import { type AgentIdentitySpec, assembleBundle, type BundleSpec, tarBundle } from "./agent-bundle.js";
@@ -75,26 +76,29 @@ export class GitHubActionsRuntime implements AgentRuntime {
 			name: request.name,
 			workDir: request.workDir,
 			files: request.syncFiles,
-			includeCredentials: true,
+			// Credentials are NOT embedded in the tarball — they're passed via GitHub secrets
+			includeCredentials: false,
 			cwd: process.cwd(),
 		};
 
 		const bundleDir = await assembleBundle(bundleSpec);
 		const tarPath = await tarBundle(bundleDir);
 
-		// Read bundle contents for embedding in the workflow
-		const envVars = JSON.parse(readFileSync(join(bundleDir, "agent", "env.json"), "utf-8")) as Record<string, string>;
+		// Read bundle contents
 		const settings = JSON.parse(readFileSync(join(bundleDir, "agent", "settings.json"), "utf-8")) as Record<
 			string,
 			unknown
 		>;
 		const prompt = readFileSync(join(bundleDir, "agent", "prompt.txt"), "utf-8");
 
-		// Read the tarball as base64 for embedding in the workflow
-		const tarBase64 = readFileSync(tarPath, "base64");
+		// Collect credential key names from the local environment
+		const credentialKeys = this.collectCredentialKeys();
 
-		// Generate the workflow YAML — the bundle is embedded as base64
-		const workflowYaml = this.generateWorkflowYaml(identity, prompt, envVars, settings, tarBase64, request);
+		// Upload the bundle as a GitHub Gist (avoids 3.8MB YAML issue)
+		const gistUrl = await this.uploadBundleGist(tarPath, agentId);
+
+		// Generate a small workflow YAML that downloads the bundle from the Gist
+		const workflowYaml = this.generateWorkflowYaml(identity, prompt, credentialKeys, settings, gistUrl, request);
 
 		// Deploy the workflow and trigger it
 		const token = this.config.token ?? process.env.GITHUB_TOKEN ?? this.getGhToken();
@@ -102,6 +106,9 @@ export class GitHubActionsRuntime implements AgentRuntime {
 
 		if (!token) throw new Error("No GitHub token. Set GITHUB_TOKEN or run `gh auth login`.");
 		if (!repo) throw new Error("No repo specified. Set repo in config or run from a git repo.");
+
+		// Set credentials as GitHub repository secrets (not embedded in YAML)
+		await this.setRepositorySecrets(repo, token, credentialKeys);
 
 		const runId = await this.triggerWorkflow(repo, token, workflowYaml, agentId);
 
@@ -142,32 +149,44 @@ export class GitHubActionsRuntime implements AgentRuntime {
 		return { identity, statusEndpoint };
 	}
 
-	/**
-	 * Generate the workflow YAML with the bundle embedded as base64.
-	 * The runner decodes the bundle, extracts it, and runs run.sh.
-	 */
+	/** Upload the bundle tarball as a secret Gist and return the raw URL. */
+	private async uploadBundleGist(tarPath: string, agentId: string): Promise<string> {
+		const tarBase64 = readFileSync(tarPath, "base64");
+		const filename = `bundle-${agentId.slice(0, 8)}.tar.gz.b64`;
+
+		const resp = await fetch("https://api.github.com/gists", {
+			method: "POST",
+			headers: {
+				Authorization: `Bearer ${this.getGhToken()}`,
+				Accept: "application/vnd.github+json",
+			},
+			body: JSON.stringify({
+				description: `Prime Agent bundle ${agentId.slice(0, 8)}`,
+				public: false,
+				files: {
+					[filename]: { content: tarBase64 },
+				},
+			}),
+		});
+
+		if (!resp.ok) {
+			throw new Error(`Failed to upload gist: ${resp.status}`);
+		}
+
+		const data = (await resp.json()) as { files: Record<string, { raw_url: string }> };
+		return data.files[filename].raw_url;
+	}
+
 	private generateWorkflowYaml(
 		identity: AgentIdentity,
 		_prompt: string,
-		envVars: Record<string, string>,
+		credentialKeys: string[],
 		_settings: Record<string, unknown>,
-		tarBase64: string,
+		gistUrl: string,
 		_request: SpawnRequest,
 	): string {
-		// The bundle is embedded as a base64-encoded tarball in a script step
-		// We split it into chunks to avoid YAML line-length issues
-		const chunkSize = 70000;
-		const chunks: string[] = [];
-		for (let i = 0; i < tarBase64.length; i += chunkSize) {
-			chunks.push(tarBase64.slice(i, i + chunkSize));
-		}
-
-		const bundleScript = chunks.map((chunk) => `          echo '${chunk}' >> /tmp/bundle.b64`).join("\n");
-
-		// Build YAML without template literals to avoid ${{ }} conflicts
 		const lines: string[] = [
-			// biome-ignore lint/suspicious/noTemplateCurlyInString: GitHub Actions syntax
-			"name: Prime Agent ${{ github.run_id }}",
+			"name: Prime Agent",
 			"on:",
 			"  workflow_dispatch:",
 			"    inputs:",
@@ -184,8 +203,7 @@ export class GitHubActionsRuntime implements AgentRuntime {
 			"      AGENT_ID: ${{ github.event.inputs.agent_id }}",
 		];
 
-		// Add env vars from secrets
-		for (const k of Object.keys(envVars)) {
+		for (const k of credentialKeys) {
 			lines.push(`      ${k}: \${{ secrets.${k} }}`);
 		}
 
@@ -196,21 +214,16 @@ export class GitHubActionsRuntime implements AgentRuntime {
 			"        with:",
 			"          node-version: '22'",
 			"",
-			"      - name: Extract Agent Bundle",
+			"      - name: Download and Extract Agent Bundle",
 			"        run: |",
-		);
-
-		// Add base64 chunks
-		for (const line of bundleScript.split("\n")) {
-			lines.push(line);
-		}
-
-		lines.push(
+			`          curl -sL "${gistUrl}" -o /tmp/bundle.b64`,
 			"          base64 -d /tmp/bundle.b64 > /tmp/bundle.tar.gz",
 			"          mkdir -p /tmp/agent-bundle",
 			"          tar xzf /tmp/bundle.tar.gz -C /tmp/agent-bundle",
 			"          BUNDLE_DIR=$(ls /tmp/agent-bundle)",
 			'          echo "BUNDLE_DIR=/tmp/agent-bundle/$BUNDLE_DIR" >> $GITHUB_ENV',
+			"          mkdir -p $BUNDLE_DIR/agent",
+			`          BUNDLE_DIR=$BUNDLE_DIR node -e 'const fs=require("fs");const keys=${JSON.stringify(credentialKeys)};const env={};for(const k of keys){env[k]=process.env[k]||"";}fs.writeFileSync(process.env.BUNDLE_DIR+"/agent/env.json",JSON.stringify(env,null,2));'`,
 			"",
 			"      - name: Run Agent",
 			"        run: |",
@@ -219,9 +232,8 @@ export class GitHubActionsRuntime implements AgentRuntime {
 			`          AGENT_ID: ${identity.agentId}`,
 		);
 
-		// Add actual env var values for the run step
-		for (const [k, v] of Object.entries(envVars)) {
-			lines.push(`          ${k}: "${v.replace(/"/g, '\\"')}"`);
+		for (const k of credentialKeys) {
+			lines.push(`          ${k}: \${{ secrets.${k} }}`);
 		}
 
 		lines.push(
@@ -233,7 +245,6 @@ export class GitHubActionsRuntime implements AgentRuntime {
 			// biome-ignore lint/suspicious/noTemplateCurlyInString: GitHub Actions syntax
 			"          name: agent-results-${{ github.run_id }}",
 			"          path: |",
-			"            $HOME/.prime/agent/sessions/",
 			"            /tmp/agent-bundle/",
 		);
 
@@ -242,80 +253,115 @@ export class GitHubActionsRuntime implements AgentRuntime {
 
 	private getGhToken(): string | undefined {
 		try {
-			const { execSync } = require("node:child_process");
 			return execSync("gh auth token", { encoding: "utf-8" }).trim() || undefined;
 		} catch {
 			return undefined;
 		}
 	}
 
+	/** Collect API key names from the local environment — values are NOT embedded. */
+	private collectCredentialKeys(): string[] {
+		const keyPatterns = [/.*_API_KEY$/, /.*_TOKEN$/, /.*_SECRET$/, /.*_OAUTH_TOKEN$/];
+		return Object.keys(process.env)
+			.filter((k) => keyPatterns.some((p) => p.test(k)) && process.env[k])
+			.slice(0, 20); // Limit to avoid hitting GitHub secret limits
+	}
+
+	/** Set credentials as GitHub repository secrets using gh CLI. */
+	private async setRepositorySecrets(repo: string, _token: string, keys: string[]): Promise<void> {
+		for (const keyName of keys) {
+			const value = process.env[keyName];
+			if (!value) continue;
+			try {
+				execSync(`gh secret set ${keyName} --repo ${repo}`, {
+					input: value,
+					encoding: "utf-8",
+					stdio: ["pipe", "pipe", "pipe"],
+					env: process.env,
+				});
+			} catch (err) {
+				console.error(`Failed to set secret ${keyName}:`, err);
+			}
+		}
+	}
+
 	private detectRepo(): string | undefined {
 		try {
-			const { execSync } = require("node:child_process");
-			const remote = execSync("git remote get-url origin", { encoding: "utf-8" }).trim();
-			const match = remote.match(/github\.com[:/]([^/]+\/[^/\s]+)/);
-			return match?.[1]?.replace(/\.git$/, "");
+			// Try fork first (user has push access), then origin
+			for (const remoteName of ["fork", "origin"]) {
+				try {
+					const remote = execSync(`git remote get-url ${remoteName}`, { encoding: "utf-8" }).trim();
+					const match = remote.match(/github\.com[:/]([^/]+\/[^/\s]+)/);
+					if (match) return match[1].replace(/\.git$/, "");
+				} catch {}
+			}
+			return undefined;
 		} catch {
 			return undefined;
 		}
 	}
 
 	private async triggerWorkflow(repo: string, token: string, workflowYaml: string, agentId: string): Promise<number> {
-		// Create a workflow file in the repo and trigger it
-		const branch = `agent-${agentId.slice(0, 8)}`;
+		// Push workflow to the default branch (required for workflow_dispatch)
 		const workflowFile = `.github/workflows/agent-${agentId.slice(0, 8)}.yml`;
 
-		// Get the default branch SHA
+		// Get the default branch
 		const repoResp = await fetch(`https://api.github.com/repos/${repo}`, {
 			headers: { Authorization: `Bearer ${token}`, Accept: "application/vnd.github+json" },
 		});
 		const repoData = (await repoResp.json()) as { default_branch: string };
 		const defaultBranch = repoData.default_branch;
 
-		// Get the SHA of the default branch
-		const refResp = await fetch(`https://api.github.com/repos/${repo}/git/refs/heads/${defaultBranch}`, {
-			headers: { Authorization: `Bearer ${token}`, Accept: "application/vnd.github+json" },
-		});
-		const refData = (await refResp.json()) as { object: { sha: string } };
-		const baseSha = refData.object.sha;
+		// Create or update the workflow file on the default branch
+		// First check if it already exists
+		const checkResp = await fetch(
+			`https://api.github.com/repos/${repo}/contents/${workflowFile}?ref=${defaultBranch}`,
+			{
+				headers: { Authorization: `Bearer ${token}`, Accept: "application/vnd.github+json" },
+			},
+		);
+		const existingSha = checkResp.ok ? ((await checkResp.json()) as { sha?: string }).sha : undefined;
 
-		// Create a new branch
-		await fetch(`https://api.github.com/repos/${repo}/git/refs`, {
-			method: "POST",
-			headers: { Authorization: `Bearer ${token}`, Accept: "application/vnd.github+json" },
-			body: JSON.stringify({ ref: `refs/heads/${branch}`, sha: baseSha }),
-		});
-
-		// Create the workflow file on the branch
-		await fetch(`https://api.github.com/repos/${repo}/contents/${workflowFile}`, {
+		const fileResp = await fetch(`https://api.github.com/repos/${repo}/contents/${workflowFile}`, {
 			method: "PUT",
 			headers: { Authorization: `Bearer ${token}`, Accept: "application/vnd.github+json" },
 			body: JSON.stringify({
 				message: `Deploy agent ${agentId.slice(0, 8)}`,
 				content: Buffer.from(workflowYaml).toString("base64"),
-				branch,
+				branch: defaultBranch,
+				...(existingSha ? { sha: existingSha } : {}),
 			}),
 		});
+		if (!fileResp.ok) {
+			const errText = await fileResp.text();
+			throw new Error(`Failed to create workflow file: ${fileResp.status} ${errText}`);
+		}
 
-		// Trigger workflow_dispatch
+		// Wait for GitHub to index the workflow
+		await new Promise((r) => setTimeout(r, 15000));
+
+		// Trigger workflow_dispatch on the default branch
+		const workflowFilename = workflowFile.split("/").pop();
 		const triggerResp = await fetch(
-			`https://api.github.com/repos/${repo}/actions/workflows/${workflowFile.split("/").pop()}/dispatches`,
+			`https://api.github.com/repos/${repo}/actions/workflows/${workflowFilename}/dispatches`,
 			{
 				method: "POST",
 				headers: { Authorization: `Bearer ${token}`, Accept: "application/vnd.github+json" },
-				body: JSON.stringify({ ref: branch, inputs: { agent_id: agentId } }),
+				body: JSON.stringify({ ref: defaultBranch, inputs: { agent_id: agentId } }),
 			},
 		);
 
 		if (!triggerResp.ok) {
-			throw new Error(`Failed to trigger workflow: ${triggerResp.status}`);
+			const errText = await triggerResp.text();
+			throw new Error(`Failed to trigger workflow: ${triggerResp.status} ${errText}`);
 		}
 
 		// Poll for the run ID
-		await new Promise((r) => setTimeout(r, 3000));
-		const runsResp = await fetch(`https://api.github.com/repos/${repo}/actions/runs?branch=${branch}&per_page=1`, {
-			headers: { Authorization: `Bearer ${token}`, Accept: "application/vnd.github+json" },
-		});
+		await new Promise((r) => setTimeout(r, 5000));
+		const runsResp = await fetch(
+			`https://api.github.com/repos/${repo}/actions/workflows/${workflowFilename}/runs?per_page=1`,
+			{ headers: { Authorization: `Bearer ${token}`, Accept: "application/vnd.github+json" } },
+		);
 		const runsData = (await runsResp.json()) as { workflow_runs: Array<{ id: number }> };
 		return runsData.workflow_runs[0]?.id ?? 0;
 	}
