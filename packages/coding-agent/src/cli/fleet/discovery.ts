@@ -186,11 +186,12 @@ async function* fromTailscale(signal?: AbortSignal): AsyncGenerator<AddressResul
 		const data = JSON.parse(stdout);
 
 		if (data.Self?.TailscaleIPs?.[0] && data.Self?.HostName) {
+			const selfDnsName = data.Self.DNSName?.replace(/\.ts\.net\.?$/, "").split(".")[0];
 			yield {
 				address: data.Self.TailscaleIPs[0],
 				source: "tailscale",
 				hints: {
-					hostname: data.Self.HostName,
+					hostname: selfDnsName || data.Self.HostName,
 					os: data.Self.OS,
 					online: true,
 					tailscaleIp: data.Self.TailscaleIPs[0],
@@ -202,6 +203,7 @@ async function* fromTailscale(signal?: AbortSignal): AsyncGenerator<AddressResul
 		if (data.Peer) {
 			for (const peer of Object.values(data.Peer) as Array<{
 				HostName: string;
+				DNSName?: string;
 				TailscaleIPs?: string[];
 				Online?: boolean;
 				OS?: string;
@@ -209,11 +211,15 @@ async function* fromTailscale(signal?: AbortSignal): AsyncGenerator<AddressResul
 				if (signal?.aborted) return;
 				const ip = peer.TailscaleIPs?.[0];
 				if (!ip || !peer.HostName) continue;
+				// DNSName is the user-friendly Tailscale DNS name (e.g. "a2.tail98d74a.ts.net")
+				// HostName is the machine's OS hostname (e.g. "AL-LINUX03")
+				// Prefer the short DNS name — it's what the user sees in `tailscale status`
+				const dnsName = peer.DNSName?.replace(/\.ts\.net\.?$/, "").split(".")[0];
 				yield {
 					address: ip,
 					source: "tailscale",
 					hints: {
-						hostname: peer.HostName,
+						hostname: dnsName || peer.HostName,
 						os: peer.OS,
 						online: peer.Online ?? false,
 						tailscaleIp: ip,
