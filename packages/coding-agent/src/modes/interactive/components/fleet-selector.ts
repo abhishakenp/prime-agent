@@ -1,19 +1,23 @@
 /**
  * Interactive TUI component for managing the fleet.
  *
- * Shows a list of fleet hosts with their status. Actions:
- * - Enter: open host actions (connect/disconnect/bootstrap/remove/status)
- * - d: discover new devices
- * - r: refresh host statuses
+ * On open: auto-discovers networked devices and merges with registered hosts.
+ * Shows a multi-select list where you can:
+ * - Space: toggle selection (check/uncheck devices to add to fleet)
+ * - Enter: confirm batch action (add all checked devices, remove checked hosts)
+ * - r: refresh statuses
  * - q/esc: quit
+ *
+ * Checked devices that aren't in fleet yet → add on Enter.
+ * Checked hosts that are in fleet → remove on Enter.
  */
 
 import {
 	Container,
 	type Focusable,
-	type SelectItem,
-	SelectList,
-	type SelectListLayoutOptions,
+	type MultiSelectItem,
+	type MultiSelectLayoutOptions,
+	MultiSelectList,
 	Spacer,
 	Text,
 } from "@earendil-works/pi-tui";
@@ -29,21 +33,36 @@ import {
 import { theme } from "../theme/theme.js";
 import { DynamicBorder } from "./dynamic-border.js";
 
-type FleetView = "hosts" | "actions" | "discover" | "discover-actions";
+type FleetView = "main" | "host-actions" | "batch-confirm";
 
-const FLEET_SELECT_LAYOUT: SelectListLayoutOptions = {
+interface FleetEntry {
+	hostname: string;
+	address: string;
+	os?: string;
+	tags: string[];
+	source: "fleet" | "discovered";
+	online: boolean;
+	sshable: boolean;
+	hasPi: boolean;
+	piVersion?: string;
+	inFleet: boolean;
+	/** Original fleet host if in fleet. */
+	fleetHost?: FleetHost;
+	/** Original discovered device. */
+	device?: DiscoveredDevice;
+}
+
+const FLEET_MS_LAYOUT: MultiSelectLayoutOptions = {
 	minPrimaryColumnWidth: 16,
-	maxPrimaryColumnWidth: 30,
+	maxPrimaryColumnWidth: 32,
 };
 
 export class FleetSelectorComponent extends Container implements Focusable {
 	focused = false;
-	private selectList: SelectList;
-	private currentView: FleetView = "hosts";
-	private hosts: FleetHost[] = [];
-	private discoveredDevices: DiscoveredDevice[] = [];
-	private selectedHost: FleetHost | null = null;
-	private selectedDevice: DiscoveredDevice | null = null;
+	private multiSelect: MultiSelectList;
+	private currentView: FleetView = "main";
+	private entries: FleetEntry[] = [];
+	private selectedEntry: FleetEntry | null = null;
 	private statusText = "";
 	private isLoading = false;
 	private readonly onDone: () => void;
@@ -53,369 +72,295 @@ export class FleetSelectorComponent extends Container implements Focusable {
 		super();
 		this.onDone = onDone;
 		this.requestRender = requestRender;
-		this.selectList = new SelectList([], 15, getFleetSelectListTheme(), FLEET_SELECT_LAYOUT);
-		this.selectList.onSelect = (item) => {
-			void this.handleSelect(item);
+		this.multiSelect = new MultiSelectList([], 20, getFleetMsTheme(), FLEET_MS_LAYOUT);
+		this.multiSelect.onConfirm = (items) => {
+			void this.handleBatchConfirm(items);
 		};
-		this.selectList.onCancel = () => this.handleCancel();
+		this.multiSelect.onCancel = () => this.handleCancel();
 		this.addChild(new DynamicBorder());
 		this.addChild(new Text(theme.bold(theme.fg("accent", "Fleet Manager")), 1, 0));
 		this.addChild(new Spacer(1));
-		this.addChild(this.selectList);
+		this.addChild(this.multiSelect);
 		this.addChild(new Spacer(1));
 		this.addChild(new Text("", 1, 0));
 		this.addChild(new DynamicBorder());
-		void this.refreshHosts();
+		void this.autoDiscover();
 	}
 
-	getSelectList(): SelectList {
-		return this.selectList;
+	getMultiSelect(): MultiSelectList {
+		return this.multiSelect;
 	}
 
-	// ─── View rendering ───────────────────────────────────────────────
+	// ─── Auto-discover on open ────────────────────────────────────────
 
-	private async refreshHosts(): Promise<void> {
-		this.setLoading("Loading fleet...");
-		this.hosts = await listFleetHosts();
+	private async autoDiscover(): Promise<void> {
+		this.setLoading("Discovering networked devices...");
+		const [fleetHosts, devices] = await Promise.all([
+			listFleetHosts(),
+			discoverDevices({}).catch(() => [] as DiscoveredDevice[]),
+		]);
 		this.clearLoading();
-		this.showHostsView();
+		this.entries = mergeHostsAndDevices(fleetHosts, devices);
+		this.showMainView();
 	}
 
-	private showHostsView(): void {
-		this.currentView = "hosts";
-		const items: SelectItem[] = this.hosts.map((host) => ({
-			value: host.hostname,
-			label: host.hostname,
-			description: formatHostDescription(host),
+	// ─── Views ────────────────────────────────────────────────────────
+
+	private showMainView(): void {
+		this.currentView = "main";
+		const fleetNames = new Set(this.entries.filter((e) => e.inFleet).map((e) => e.hostname.toLowerCase()));
+		const items: MultiSelectItem[] = this.entries.map((entry) => ({
+			value: entry.hostname,
+			label: entry.hostname,
+			description: formatEntryDescription(entry),
+			checked: false,
+			disabled: false,
 		}));
-		items.push({
-			value: "__discover__",
-			label: "Discover devices",
-			description: "Scan network for accessible hosts",
-		});
-		items.push({ value: "__refresh__", label: "Refresh statuses", description: "Re-probe all fleet hosts" });
-		// Set status BEFORE updateSelectList so the Text is created with correct content
-		this.statusText =
-			this.hosts.length > 0
-				? `${this.hosts.length} host(s) · Enter to manage · d to discover · q to quit`
-				: "No hosts · d to discover · q to quit";
-		this.updateSelectList(items);
+
+		const onlineCount = this.entries.filter((e) => e.online).length;
+		const fleetCount = fleetNames.size;
+		this.statusText = `${this.entries.length} devices (${onlineCount} online, ${fleetCount} in fleet) · Space to select · Enter to add/remove · r to refresh · q to quit`;
+		this.rebuildChildren(items);
 	}
 
-	private showActionsView(host: FleetHost): void {
-		this.currentView = "actions";
-		this.selectedHost = host;
-		const items: SelectItem[] = [
-			{ value: "status", label: "Check status", description: "Probe SSH, pi, and daemon" },
+	private showHostActionsView(entry: FleetEntry): void {
+		this.currentView = "host-actions";
+		this.selectedEntry = entry;
+		// Use multiSelect as a simple action list (single-select via Enter)
+		const items: MultiSelectItem[] = [
+			{ value: "status", label: "Check status", description: "Probe SSH, pi, daemon", disabled: true },
 			{
 				value: "bootstrap",
 				label: "Bootstrap (install pi + start daemon)",
-				description: host.piVersion ? `Pi ${host.piVersion} already installed` : "Install pi via npm",
+				description: entry.piVersion ? `Pi ${entry.piVersion} installed` : "Install pi via npm",
+				disabled: true,
 			},
-			{ value: "connect", label: "Connect to gateway", description: "Mark as connected" },
-			{ value: "disconnect", label: "Disconnect", description: "Stop daemon on host" },
-			{ value: "remove", label: `Remove "${host.hostname}" from fleet`, description: "Unregister this host" },
-			{ value: "__back__", label: "← Back to hosts", description: "" },
-		];
-		this.statusText = `Managing "${host.hostname}" · esc to go back`;
-		this.updateSelectList(items);
-	}
-
-	private showDiscoverView(): void {
-		this.currentView = "discover";
-		const online = this.discoveredDevices.filter((d) => d.online !== false);
-		const inFleet = new Set(this.hosts.map((h) => h.hostname.toLowerCase()));
-
-		const items: SelectItem[] = online.map((device) => ({
-			value: device.hostname,
-			label: device.hostname,
-			description: formatDeviceDescription(device, inFleet.has(device.hostname.toLowerCase())),
-		}));
-
-		if (items.length === 0) {
-			this.statusText = "No online devices found · esc to go back";
-			this.updateSelectList([{ value: "__back__", label: "← Back", description: "" }]);
-			return;
-		}
-
-		items.push({ value: "__back__", label: "← Back to hosts", description: "" });
-		this.statusText = `${online.length} online device(s) · Enter to add · esc to go back`;
-		this.updateSelectList(items);
-	}
-
-	private showDiscoverActionsView(device: DiscoveredDevice): void {
-		this.currentView = "discover-actions";
-		this.selectedDevice = device;
-		const inFleet = this.hosts.some((h) => h.hostname.toLowerCase() === device.hostname.toLowerCase());
-
-		const items: SelectItem[] = [];
-
-		if (!inFleet) {
-			items.push({
+			{ value: "connect", label: "Connect to gateway", description: "Mark as connected", disabled: true },
+			{ value: "disconnect", label: "Disconnect", description: "Stop daemon on host", disabled: true },
+			{
+				value: "remove",
+				label: `Remove "${entry.hostname}" from fleet`,
+				description: "Unregister",
+				disabled: !entry.inFleet,
+			},
+			{
 				value: "add",
-				label: `Add "${device.hostname}" to fleet`,
-				description: `Tags: ${inferTags(device).join(", ")}`,
-			});
-		} else {
-			items.push({
-				value: "already",
-				label: `"${device.hostname}" is already in fleet`,
-				description: "",
-			});
-		}
-
-		if (device.sshable && !device.hasPi) {
-			items.push({
-				value: "bootstrap",
-				label: "Bootstrap (install pi + start daemon)",
-				description: "Install pi via npm on this device",
-			});
-		}
-
-		items.push({ value: "__back__", label: "← Back to devices", description: "" });
-		this.statusText = `Device: ${device.hostname} (${device.os ?? "?"}) · esc to go back`;
-		this.updateSelectList(items);
+				label: `Add "${entry.hostname}" to fleet`,
+				description: `Tags: ${entry.tags.join(", ")}`,
+				disabled: entry.inFleet,
+			},
+			{ value: "__back__", label: "← Back", description: "", disabled: true },
+		];
+		this.statusText = `${entry.hostname} · Enter to execute · esc to go back`;
+		this.rebuildChildren(items);
 	}
 
 	// ─── Event handling ───────────────────────────────────────────────
 
-	private async handleSelect(item: SelectItem): Promise<void> {
-		const value = item.value;
-
-		if (this.currentView === "hosts") {
-			if (value === "__discover__") {
-				await this.runDiscover();
-				return;
-			}
-			if (value === "__refresh__") {
-				await this.runRefreshAll();
-				return;
-			}
-			const host = this.hosts.find((h) => h.hostname === value);
-			if (host) {
-				this.showActionsView(host);
+	private async handleBatchConfirm(checkedItems: MultiSelectItem[]): Promise<void> {
+		if (this.currentView !== "main") {
+			// In host-actions view, Enter executes the selected action
+			const selected = this.multiSelect["items" as unknown as keyof MultiSelectList] as unknown as MultiSelectItem[];
+			const current =
+				selected[this.multiSelect["selectedIndex" as unknown as keyof MultiSelectList] as unknown as number];
+			if (current) {
+				await this.handleHostAction(current.value);
 			}
 			return;
 		}
 
-		if (this.currentView === "actions" && this.selectedHost) {
-			await this.handleHostAction(value);
-			return;
-		}
-
-		if (this.currentView === "discover") {
-			if (value === "__back__") {
-				this.showHostsView();
-				return;
-			}
-			const device = this.discoveredDevices.find((d) => d.hostname === value);
-			if (device) {
-				this.showDiscoverActionsView(device);
+		if (checkedItems.length === 0) {
+			// No items checked — open host actions for the highlighted item
+			const currentItem = this.entries[this.getCurrentIndex()];
+			if (currentItem) {
+				this.showHostActionsView(currentItem);
 			}
 			return;
 		}
 
-		if (this.currentView === "discover-actions" && this.selectedDevice) {
-			await this.handleDiscoverAction(value);
-			return;
+		// Batch: add checked non-fleet devices, remove checked fleet hosts
+		const toAdd = checkedItems.filter((item) => {
+			const entry = this.entries.find((e) => e.hostname === item.value);
+			return entry && !entry.inFleet;
+		});
+		const toRemove = checkedItems.filter((item) => {
+			const entry = this.entries.find((e) => e.hostname === item.value);
+			return entry && entry.inFleet;
+		});
+
+		this.setLoading(`Processing ${toAdd.length} add(s), ${toRemove.length} remove(s)...`);
+
+		for (const item of toAdd) {
+			const entry = this.entries.find((e) => e.hostname === item.value);
+			if (!entry) continue;
+			const host: FleetHost = {
+				hostname: entry.hostname,
+				address: entry.address,
+				tags: entry.tags.length > 0 ? entry.tags : inferTags(entry.device ?? entryAsDevice(entry)),
+				capabilities: ["bash", "ipython", "browser"],
+				os: entry.os,
+				addedAt: Date.now(),
+				lastStatus: entry.sshable ? "disconnected" : "unreachable",
+				piVersion: entry.piVersion,
+			};
+			await addFleetHost(host);
 		}
+
+		for (const item of toRemove) {
+			await removeFleetHost(item.value);
+		}
+
+		this.clearLoading();
+		const actions: string[] = [];
+		if (toAdd.length > 0) actions.push(`added ${toAdd.length}`);
+		if (toRemove.length > 0) actions.push(`removed ${toRemove.length}`);
+		this.statusText = `✓ ${actions.join(", ")}`;
+		// Refresh
+		await this.autoDiscover();
 	}
 
 	private async handleHostAction(action: string): Promise<void> {
-		const host = this.selectedHost;
-		if (!host) return;
+		const entry = this.selectedEntry;
+		if (!entry) return;
 
 		switch (action) {
 			case "status": {
-				this.setLoading(`Probing ${host.hostname}...`);
-				const status = await checkHostStatus(host.address);
+				this.setLoading(`Probing ${entry.hostname}...`);
+				const status = await checkHostStatus(entry.address);
 				this.clearLoading();
-				this.setStatus(
-					`${host.hostname}: ${status.online ? "✓ online" : "✗ offline"} · pi ${status.piInstalled ? "✓" : "✗"} · daemon ${status.daemonRunning ? "✓" : "✗"}`,
-				);
-				if (status.piVersion) host.piVersion = status.piVersion;
-				host.lastStatus = status.online ? (status.daemonRunning ? "connected" : "disconnected") : "unreachable";
-				await updateFleetHostStatus(host.hostname, host.lastStatus);
-				this.showActionsView(host);
+				this.statusText = `${entry.hostname}: ${status.online ? "✓ online" : "✗ offline"} · pi ${status.piInstalled ? "✓" : "✗"} · daemon ${status.daemonRunning ? "✓" : "✗"}`;
+				if (entry.inFleet && entry.fleetHost) {
+					entry.fleetHost.piVersion = status.piVersion;
+					entry.fleetHost.lastStatus = status.online
+						? status.daemonRunning
+							? "connected"
+							: "disconnected"
+						: "unreachable";
+					await updateFleetHostStatus(entry.hostname, entry.fleetHost.lastStatus);
+				}
+				this.showHostActionsView(entry);
 				break;
 			}
 			case "bootstrap": {
-				this.setLoading(`Bootstrapping ${host.hostname}...`);
+				this.setLoading(`Bootstrapping ${entry.hostname}...`);
 				const result = await bootstrapHost({
-					target: host.address,
-					hostname: host.hostname,
-					tags: host.tags,
-					capabilities: host.capabilities,
+					target: entry.address,
+					hostname: entry.hostname,
+					tags: entry.tags,
+					capabilities: ["bash", "ipython", "browser"],
 				});
 				this.clearLoading();
 				if (result.success) {
-					this.setStatus(`✓ Bootstrap complete: ${host.hostname}`);
-					if (result.piVersion) host.piVersion = result.piVersion;
-					await updateFleetHostStatus(host.hostname, "connected");
+					this.statusText = `✓ Bootstrap complete: ${entry.hostname}`;
+					if (!entry.inFleet) {
+						const host: FleetHost = {
+							hostname: entry.hostname,
+							address: entry.address,
+							tags: entry.tags,
+							capabilities: ["bash", "ipython", "browser"],
+							os: entry.os,
+							addedAt: Date.now(),
+							lastStatus: "connected",
+							piVersion: result.piVersion,
+						};
+						await addFleetHost(host);
+					} else if (entry.fleetHost) {
+						entry.fleetHost.piVersion = result.piVersion;
+						await updateFleetHostStatus(entry.hostname, "connected");
+					}
 				} else {
-					this.setStatus(`✗ Bootstrap failed: ${result.error}`);
+					this.statusText = `✗ Bootstrap failed: ${result.error}`;
 				}
-				this.showActionsView(host);
+				await this.autoDiscover();
 				break;
 			}
 			case "connect": {
-				await updateFleetHostStatus(host.hostname, "connected");
-				this.setStatus(`✓ ${host.hostname} marked connected`);
-				this.showActionsView(host);
+				if (entry.inFleet) {
+					await updateFleetHostStatus(entry.hostname, "connected");
+					this.statusText = `✓ ${entry.hostname} connected`;
+				}
+				this.showHostActionsView(entry);
 				break;
 			}
 			case "disconnect": {
-				this.setLoading(`Disconnecting ${host.hostname}...`);
-				await disconnectHost(host.address);
+				this.setLoading(`Disconnecting ${entry.hostname}...`);
+				await disconnectHost(entry.address);
 				this.clearLoading();
-				await updateFleetHostStatus(host.hostname, "disconnected");
-				this.setStatus(`✓ ${host.hostname} disconnected`);
-				this.showActionsView(host);
+				if (entry.inFleet) {
+					await updateFleetHostStatus(entry.hostname, "disconnected");
+				}
+				this.statusText = `✓ ${entry.hostname} disconnected`;
+				this.showHostActionsView(entry);
 				break;
 			}
 			case "remove": {
-				await removeFleetHost(host.hostname);
-				this.setStatus(`✓ Removed ${host.hostname}`);
-				this.selectedHost = null;
-				await this.refreshHosts();
+				await removeFleetHost(entry.hostname);
+				this.statusText = `✓ Removed ${entry.hostname}`;
+				this.selectedEntry = null;
+				await this.autoDiscover();
 				break;
 			}
-			case "__back__":
-				this.selectedHost = null;
-				this.showHostsView();
-				break;
-		}
-	}
-
-	private async handleDiscoverAction(action: string): Promise<void> {
-		const device = this.selectedDevice;
-		if (!device) return;
-
-		switch (action) {
 			case "add": {
-				const tags = inferTags(device);
+				const tags = entry.tags.length > 0 ? entry.tags : inferTags(entry.device ?? entryAsDevice(entry));
 				const host: FleetHost = {
-					hostname: device.hostname,
-					address: device.tailscaleIp ?? device.address,
+					hostname: entry.hostname,
+					address: entry.address,
 					tags,
 					capabilities: ["bash", "ipython", "browser"],
-					os: device.os,
+					os: entry.os,
 					addedAt: Date.now(),
-					lastStatus: device.sshable ? "disconnected" : "unreachable",
-					piVersion: device.piVersion,
+					lastStatus: entry.sshable ? "disconnected" : "unreachable",
+					piVersion: entry.piVersion,
 				};
 				await addFleetHost(host);
-				this.setStatus(`✓ Added ${device.hostname} (tags: ${tags.join(", ")})`);
-				this.selectedDevice = null;
-				await this.refreshHosts();
-				break;
-			}
-			case "bootstrap": {
-				this.setLoading(`Bootstrapping ${device.hostname}...`);
-				const result = await bootstrapHost({
-					target: device.tailscaleIp ?? device.address,
-					hostname: device.hostname,
-					tags: inferTags(device),
-					capabilities: ["bash", "ipython", "browser"],
-				});
-				this.clearLoading();
-				if (result.success) {
-					const host: FleetHost = {
-						hostname: device.hostname,
-						address: device.tailscaleIp ?? device.address,
-						tags: inferTags(device),
-						capabilities: ["bash", "ipython", "browser"],
-						os: device.os,
-						addedAt: Date.now(),
-						lastStatus: "connected",
-						piVersion: result.piVersion,
-					};
-					await addFleetHost(host);
-					this.setStatus(`✓ Bootstrapped and added ${device.hostname}`);
-				} else {
-					this.setStatus(`✗ Bootstrap failed: ${result.error}`);
-				}
-				this.selectedDevice = null;
-				await this.refreshHosts();
+				this.statusText = `✓ Added ${entry.hostname}`;
+				this.selectedEntry = null;
+				await this.autoDiscover();
 				break;
 			}
 			case "__back__":
-				this.selectedDevice = null;
-				this.showDiscoverView();
+				this.selectedEntry = null;
+				this.showMainView();
 				break;
 		}
-	}
-
-	private async runDiscover(): Promise<void> {
-		this.setLoading("Scanning network for devices...");
-		this.discoveredDevices = await discoverDevices({});
-		this.clearLoading();
-		const online = this.discoveredDevices.filter((d) => d.online !== false);
-		this.setStatus(`Found ${this.discoveredDevices.length} devices (${online.length} online)`);
-		this.showDiscoverView();
-	}
-
-	private async runRefreshAll(): Promise<void> {
-		this.setLoading("Refreshing all hosts...");
-		for (const host of this.hosts) {
-			const status = await checkHostStatus(host.address);
-			host.lastStatus = status.online ? (status.daemonRunning ? "connected" : "disconnected") : "unreachable";
-			if (status.piVersion) host.piVersion = status.piVersion;
-			await updateFleetHostStatus(host.hostname, host.lastStatus);
-		}
-		this.clearLoading();
-		this.showHostsView();
 	}
 
 	private handleCancel(): void {
-		if (this.currentView === "hosts") {
+		if (this.currentView === "main") {
 			this.onDone();
-		} else if (this.currentView === "actions") {
-			this.selectedHost = null;
-			this.showHostsView();
-		} else if (this.currentView === "discover") {
-			this.showHostsView();
-		} else if (this.currentView === "discover-actions") {
-			this.selectedDevice = null;
-			this.showDiscoverView();
+		} else {
+			this.selectedEntry = null;
+			this.showMainView();
 		}
 	}
 
 	// ─── Keyboard ─────────────────────────────────────────────────────
 
 	handleInput(data: string): void {
-		// 'd' to discover from hosts view
-		if (this.currentView === "hosts" && (data === "d" || data === "\x04")) {
-			void this.runDiscover();
+		if (this.currentView === "main" && data === "r") {
+			void this.autoDiscover();
 			return;
 		}
-		// 'q' to quit from hosts view
-		if (this.currentView === "hosts" && data === "q") {
+		if (this.currentView === "main" && data === "q") {
 			this.onDone();
 			return;
 		}
-		// 'r' to refresh from hosts view
-		if (this.currentView === "hosts" && data === "r") {
-			void this.runRefreshAll();
-			return;
-		}
-		// Delegate to select list
-		this.selectList.handleInput?.(data);
+		this.multiSelect.handleInput(data);
 	}
 
 	// ─── Helpers ──────────────────────────────────────────────────────
 
-	private updateSelectList(items: SelectItem[]): void {
-		this.selectList = new SelectList(items, 15, getFleetSelectListTheme(), FLEET_SELECT_LAYOUT);
-		this.selectList.onSelect = (item) => {
-			void this.handleSelect(item);
-		};
-		this.selectList.onCancel = () => this.handleCancel();
+	private getCurrentIndex(): number {
+		return (this.multiSelect as unknown as { selectedIndex: number }).selectedIndex;
+	}
+
+	private rebuildChildren(items: MultiSelectItem[]): void {
+		this.multiSelect.setItems(items);
 		this.children = [];
 		this.addChild(new DynamicBorder());
 		this.addChild(new Text(theme.bold(theme.fg("accent", "Fleet Manager")), 1, 0));
 		this.addChild(new Spacer(1));
-		this.addChild(this.selectList);
+		this.addChild(this.multiSelect);
 		this.addChild(new Spacer(1));
 		this.addChild(new Text(this.isLoading ? theme.fg("dim", this.statusText) : this.statusText, 1, 0));
 		this.addChild(new DynamicBorder());
@@ -431,44 +376,112 @@ export class FleetSelectorComponent extends Container implements Focusable {
 	private clearLoading(): void {
 		this.isLoading = false;
 	}
-
-	private setStatus(text: string): void {
-		this.statusText = text;
-		this.requestRender();
-	}
 }
 
 // ─── Theme ─────────────────────────────────────────────────────────
 
-function getFleetSelectListTheme() {
+function getFleetMsTheme() {
 	return {
-		selectedPrefix: (text: string) => theme.fg("accent", `> ${text}`),
+		selectedPrefix: (text: string) => theme.fg("accent", text),
 		selectedText: (text: string) => theme.bold(text),
 		description: (text: string) => theme.fg("dim", text),
 		scrollInfo: (text: string) => theme.fg("dim", text),
 		noMatch: (text: string) => theme.fg("dim", text),
+		checkbox: (checked: boolean, selected: boolean) => {
+			const box = checked ? "[✓]" : "[ ]";
+			if (selected) return theme.fg("accent", box);
+			return theme.fg("dim", box);
+		},
+		hint: (text: string) => theme.fg("dim", text),
 	};
 }
 
-// ─── Formatting ────────────────────────────────────────────────────
+// ─── Merge & format ────────────────────────────────────────────────
 
-function formatHostDescription(host: FleetHost): string {
+function mergeHostsAndDevices(fleetHosts: FleetHost[], devices: DiscoveredDevice[]): FleetEntry[] {
+	const entries: FleetEntry[] = [];
+	const seen = new Set<string>();
+
+	// Add fleet hosts first
+	for (const host of fleetHosts) {
+		const key = host.hostname.toLowerCase();
+		seen.add(key);
+		entries.push({
+			hostname: host.hostname,
+			address: host.address,
+			os: host.os,
+			tags: host.tags,
+			source: "fleet",
+			online: host.lastStatus !== "unreachable",
+			sshable: false,
+			hasPi: Boolean(host.piVersion),
+			piVersion: host.piVersion,
+			inFleet: true,
+			fleetHost: host,
+		});
+	}
+
+	// Add discovered devices not already in fleet
+	for (const device of devices) {
+		const key = device.hostname.toLowerCase();
+		if (seen.has(key)) {
+			// Enrich existing fleet entry with discovery info
+			const existing = entries.find((e) => e.hostname.toLowerCase() === key);
+			if (existing && existing.source === "fleet") {
+				existing.online = device.online ?? existing.online;
+				existing.sshable = device.sshable ?? existing.sshable;
+				existing.hasPi = device.hasPi ?? existing.hasPi;
+				existing.piVersion = device.piVersion ?? existing.piVersion;
+				existing.os = device.os ?? existing.os;
+				existing.device = device;
+			}
+			continue;
+		}
+		seen.add(key);
+		entries.push({
+			hostname: device.hostname,
+			address: device.tailscaleIp ?? device.address,
+			os: device.os,
+			tags: inferTags(device),
+			source: "discovered",
+			online: device.online ?? false,
+			sshable: device.sshable ?? false,
+			hasPi: device.hasPi ?? false,
+			piVersion: device.piVersion,
+			inFleet: false,
+			device,
+		});
+	}
+
+	// Sort: fleet hosts first, then online discovered, then offline
+	return entries.sort((a, b) => {
+		if (a.inFleet !== b.inFleet) return a.inFleet ? -1 : 1;
+		if (a.online !== b.online) return a.online ? -1 : 1;
+		return a.hostname.localeCompare(b.hostname);
+	});
+}
+
+function formatEntryDescription(entry: FleetEntry): string {
 	const parts: string[] = [];
-	if (host.os) parts.push(host.os);
-	if (host.tags.length > 0) parts.push(host.tags.join(","));
-	const status = host.lastStatus ?? "unknown";
-	const statusIcon = status === "connected" ? "●" : status === "disconnected" ? "○" : "✗";
-	parts.push(`${statusIcon} ${status}`);
-	if (host.piVersion) parts.push(`pi ${host.piVersion}`);
+	if (entry.os) parts.push(entry.os);
+	if (entry.tags.length > 0) parts.push(entry.tags.join(","));
+	if (entry.sshable) parts.push("ssh ✓");
+	if (entry.hasPi) parts.push("pi ✓");
+	if (entry.inFleet) parts.push("● fleet");
+	else if (!entry.online) parts.push("✗ offline");
 	return parts.join(" · ");
 }
 
-function formatDeviceDescription(device: DiscoveredDevice, inFleet: boolean): string {
-	const parts: string[] = [];
-	parts.push(device.os ?? "?");
-	if (device.sshable) parts.push("ssh ✓");
-	if (device.hasPi) parts.push("pi ✓");
-	if (inFleet) parts.push("in fleet");
-	parts.push(device.source);
-	return parts.join(" · ");
+function entryAsDevice(entry: FleetEntry): DiscoveredDevice {
+	return {
+		hostname: entry.hostname,
+		source: "arp",
+		address: entry.address,
+		os: entry.os,
+		online: entry.online,
+		sshable: entry.sshable,
+		hasPi: entry.hasPi,
+		piVersion: entry.piVersion,
+		tags: entry.tags,
+	};
 }

@@ -13,6 +13,12 @@ export { Input } from "./components/input.js";
 export { Loader, type LoaderIndicatorOptions } from "./components/loader.js";
 export { type DefaultTextStyle, Markdown, type MarkdownTheme } from "./components/markdown.js";
 export {
+	type MultiSelectItem,
+	type MultiSelectLayoutOptions,
+	MultiSelectList,
+	type MultiSelectTheme,
+} from "./components/multi-select-list.js";
+export {
 	type SelectItem,
 	SelectList,
 	type SelectListLayoutOptions,

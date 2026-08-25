@@ -38,5 +38,7 @@ export async function selectFleetInteractive(): Promise<void> {
 		ui.addChild(selector);
 		ui.setFocus(selector);
 		ui.start();
+		// Note: focus is on the container so it can intercept 'r', 'q' keys
+		// MultiSelectList receives all other input via handleInput delegation
 	});
 }
