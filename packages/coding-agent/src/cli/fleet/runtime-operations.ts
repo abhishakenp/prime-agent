@@ -250,6 +250,62 @@ export function configureRuntimePlugin(
 	};
 }
 
+/** Check if a plugin has a setup() export. */
+export async function pluginHasSetup(pluginPath: string): Promise<boolean> {
+	try {
+		const mod = await import(pluginPath);
+		return typeof mod.setup === "function";
+	} catch {
+		return false;
+	}
+}
+
+/** Prompt interface for plugin setup(). */
+export interface SetupPromptInterface {
+	ask: (q: string, def?: string) => Promise<string | undefined>;
+	confirm: (q: string, def?: boolean) => Promise<boolean>;
+	choose: (q: string, options: string[]) => Promise<number>;
+	status: (msg: string) => void;
+}
+
+/** Result of a plugin setup() call. */
+export interface SetupResultData {
+	success: boolean;
+	message: string;
+	config?: Record<string, unknown>;
+}
+
+/** Run a plugin's setup() with a given prompt interface. */
+export async function runPluginSetupWithPath(
+	pluginPath: string,
+	prompt: SetupPromptInterface,
+): Promise<SetupResultData> {
+	try {
+		const mod = (await import(pluginPath)) as {
+			setup?: (config: Record<string, unknown>, prompt: SetupPromptInterface) => Promise<SetupResultData>;
+		};
+		if (!mod.setup) {
+			return { success: true, message: "No setup required" };
+		}
+		const config = readConfig(pluginPath).config ?? {};
+		return await mod.setup(config, prompt);
+	} catch (err) {
+		return { success: false, message: `Setup failed: ${err}` };
+	}
+}
+
+/** Persist config to a plugin's companion JSON (flat format). */
+export function savePluginConfig(name: string, config: Record<string, unknown>): void {
+	const userDir = userRuntimesDir();
+	const configPath = join(userDir, `${name}.json`);
+	const existing = existsSync(configPath)
+		? (JSON.parse(readFileSync(configPath, "utf-8")) as Record<string, unknown>)
+		: {};
+	// Merge: keep existing keys, update with new config, ensure enabled
+	const merged = { ...existing, ...config, enabled: true };
+	writeFileSync(configPath, JSON.stringify(merged, null, 2));
+}
+
 // ─── Helpers ────────────────────────────────────────────────────────
 
 function listPluginFiles(dir: string): string[] {
@@ -284,8 +340,18 @@ function readConfig(pluginPath: string): {
 	if (!existsSync(configPath)) return { enabled: true };
 	try {
 		const raw = readFileSync(configPath, "utf-8");
-		const parsed = JSON.parse(raw) as { config?: Record<string, unknown>; enabled?: boolean };
-		return { config: parsed.config, enabled: parsed.enabled !== false, raw };
+		const parsed = JSON.parse(raw) as Record<string, unknown>;
+		// Nested format: { "config": {...}, "enabled": true }
+		if (parsed.config && typeof parsed.config === "object") {
+			return {
+				config: parsed.config as Record<string, unknown>,
+				enabled: parsed.enabled !== false,
+				raw,
+			};
+		}
+		// Flat format: all keys except "enabled" are config
+		const { enabled, ...config } = parsed;
+		return { config, enabled: enabled !== false, raw };
 	} catch {
 		return { enabled: true };
 	}

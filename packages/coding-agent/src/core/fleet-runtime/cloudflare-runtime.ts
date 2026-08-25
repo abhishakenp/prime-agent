@@ -11,7 +11,7 @@
  * The target (CF Workers) needs nothing — the bundle IS the Worker.
  */
 
-import { spawn } from "node:child_process";
+import { execSync, spawn } from "node:child_process";
 import { existsSync, mkdirSync, readFileSync, realpathSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
@@ -529,4 +529,154 @@ function findNpxCli(): string | null {
 		}
 	}
 	return null;
+}
+
+// ─── Plugin setup (interactive) ────────────────────────────────────
+
+/**
+ * Interactive setup for the Cloudflare Workers runtime.
+ *
+ * Flow:
+ * 1. Check if wrangler is authenticated (`wrangler whoami`)
+ * 2. If not, prompt to run `wrangler login` (opens browser)
+ * 3. Extract account ID from wrangler whoami output
+ * 4. Check for workers.dev subdomain
+ * 5. Save accountId + apiToken (if available) to config
+ *
+ * Called when the user enables/installs the plugin from the fleet menu.
+ */
+export async function setupCloudflare(
+	config: Record<string, unknown>,
+	prompt: {
+		ask: (q: string, def?: string) => Promise<string | undefined>;
+		confirm: (q: string, def?: boolean) => Promise<boolean>;
+		choose: (q: string, options: string[]) => Promise<number>;
+		status: (msg: string) => void;
+	},
+): Promise<{ success: boolean; message: string; config?: Record<string, unknown> }> {
+	const newConfig = { ...config };
+
+	// 1. Check wrangler auth
+	prompt.status("Checking Cloudflare authentication...");
+	let authed = false;
+	let whoamiOutput = "";
+	try {
+		whoamiOutput = execSync("npx wrangler whoami 2>&1", {
+			encoding: "utf-8",
+			stdio: ["pipe", "pipe", "pipe"],
+			timeout: 15000,
+		});
+		authed = !whoamiOutput.includes("not authenticated") && !whoamiOutput.includes("ERR");
+	} catch (err) {
+		// wrangler whoami may exit non-zero if not logged in
+		try {
+			const output = (err as { stdout?: string }).stdout ?? "";
+			if (!output.includes("not authenticated")) {
+				whoamiOutput = output;
+				authed = true;
+			}
+		} catch {}
+	}
+
+	if (!authed) {
+		prompt.status("Not logged in to Cloudflare.");
+		const confirmed = await prompt.confirm("Open Cloudflare login in browser? (runs: npx wrangler login)", true);
+		if (confirmed) {
+			prompt.status("Running: npx wrangler login (follow prompts in browser)...");
+			try {
+				execSync("npx wrangler login", { encoding: "utf-8", stdio: "inherit", timeout: 120000 });
+				// Re-check auth
+				whoamiOutput = execSync("npx wrangler whoami 2>&1", {
+					encoding: "utf-8",
+					stdio: ["pipe", "pipe", "pipe"],
+					timeout: 15000,
+				});
+				authed = !whoamiOutput.includes("not authenticated");
+			} catch {
+				return {
+					success: false,
+					message: "Cloudflare login failed. Run `npx wrangler login` manually and retry.",
+				};
+			}
+		} else {
+			return {
+				success: false,
+				message: "Cloudflare login required. Run `npx wrangler login` and retry.",
+			};
+		}
+	}
+
+	if (!authed) {
+		return { success: false, message: "Cloudflare authentication failed." };
+	}
+
+	// 2. Extract account ID from whoami output
+	prompt.status("Extracting account info...");
+	let accountId: string | undefined = newConfig.accountId as string | undefined;
+	if (!accountId) {
+		// wrangler whoami output format: "│ Account Name │ 123abc... │"
+		const accountMatch = whoamiOutput.match(/│\s+\S.*?\s+│\s+([a-f0-9]{32})\s+│/);
+		if (accountMatch) {
+			accountId = accountMatch[1];
+			newConfig.accountId = accountId;
+		} else {
+			// Try to extract any 32-char hex
+			const hexMatch = whoamiOutput.match(/([a-f0-9]{32})/);
+			if (hexMatch) {
+				accountId = hexMatch[1];
+				newConfig.accountId = accountId;
+			}
+		}
+	}
+
+	// 3. Check for API token (optional — wrangler login may suffice)
+	if (!newConfig.apiToken) {
+		const hasToken = await prompt.confirm(
+			"Do you have a Cloudflare API token? (Optional if wrangler login works. Needed for headless/CI.)",
+			false,
+		);
+		if (hasToken) {
+			const token = await prompt.ask("Enter Cloudflare API token:");
+			if (token) {
+				newConfig.apiToken = token;
+			}
+		}
+	}
+
+	// 4. Check for workers.dev subdomain
+	if (!newConfig.workersSubdomain) {
+		prompt.status("Checking workers.dev subdomain...");
+		try {
+			const subdomainOutput = execSync("npx wrangler whoami 2>&1", {
+				encoding: "utf-8",
+				stdio: ["pipe", "pipe", "pipe"],
+				timeout: 15000,
+			});
+			// Look for workers.dev subdomain in output
+			const subdomainMatch = subdomainOutput.match(/([\w-]+)\.workers\.dev/);
+			if (subdomainMatch) {
+				newConfig.workersSubdomain = subdomainMatch[1];
+			}
+		} catch {}
+
+		if (!newConfig.workersSubdomain) {
+			const subdomain = await prompt.ask(
+				"Enter your workers.dev subdomain (e.g. 'my-name' for my-name.workers.dev):",
+			);
+			if (subdomain) {
+				newConfig.workersSubdomain = subdomain;
+			}
+		}
+	}
+
+	const parts: string[] = [];
+	if (accountId) parts.push(`account: ${accountId}`);
+	if (newConfig.workersSubdomain) parts.push(`subdomain: ${newConfig.workersSubdomain}`);
+	if (newConfig.apiToken) parts.push("API token set");
+
+	return {
+		success: true,
+		message: `Cloudflare runtime configured (${parts.join(", ")})`,
+		config: newConfig,
+	};
 }

@@ -59,6 +59,9 @@ export {
 	type LoadedPlugin,
 	loadRuntimePlugins,
 	type PluginContext,
+	runPluginSetup,
+	type SetupPrompt,
+	type SetupResult,
 	userRuntimesDir,
 } from "./runtime-plugin-loader.js";
 export { SSHRuntime } from "./ssh-runtime.js";

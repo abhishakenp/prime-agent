@@ -69,10 +69,43 @@ export function builtinRuntimesDir(): string {
 	}
 }
 
-/** Context passed to createRuntime() in plugins. */
+/** Context passed to createRuntime() and setup() in plugins. */
 export interface PluginContext {
 	/** Config from the companion JSON file. */
 	config: Record<string, unknown>;
+}
+
+/** Result of a plugin setup() call. */
+export interface SetupResult {
+	/** Whether setup succeeded. */
+	success: boolean;
+	/** Human-readable status message. */
+	message: string;
+	/** Updated config to persist to the companion JSON. */
+	config?: Record<string, unknown>;
+}
+
+/** Interactive prompt function passed to setup() for TUI/CLI interaction. */
+export interface SetupPrompt {
+	/**
+	 * Prompt the user for text input.
+	 * Returns the trimmed string, or undefined if cancelled.
+	 */
+	ask(question: string, defaultValue?: string): Promise<string | undefined>;
+	/**
+	 * Prompt the user for yes/no confirmation.
+	 * Returns true for yes, false for no.
+	 */
+	confirm(question: string, defaultValue?: boolean): Promise<boolean>;
+	/**
+	 * Present a list of options and let the user choose.
+	 * Returns the selected option index, or -1 if cancelled.
+	 */
+	choose(question: string, options: string[]): Promise<number>;
+	/**
+	 * Display a status message (non-blocking).
+	 */
+	status(message: string): void;
 }
 
 /** A loaded runtime plugin. */
@@ -89,21 +122,35 @@ export interface LoadedPlugin {
 	isUserPlugin: boolean;
 }
 
-/** Plugin module exports — at least one must be present. */
+/** Plugin module exports — at least one runtime export must be present. */
 interface PluginExports {
 	default?: new (config?: Record<string, unknown>) => AgentRuntime;
 	runtime?: AgentRuntime;
 	createRuntime?: (ctx: PluginContext) => AgentRuntime | Promise<AgentRuntime>;
+	/** Optional interactive setup — called when user enables/installs the plugin. */
+	setup?: (ctx: PluginContext, prompt: SetupPrompt) => Promise<SetupResult>;
 }
 
-/** Read optional JSON config companion file for a plugin. */
+/** Read optional JSON config companion file for a plugin.
+ *
+ * Supports two formats:
+ *   { "config": {...}, "enabled": true }   ← nested (legacy)
+ *   { "repo": "...", "enabled": true }      ← flat (all keys except "enabled" are config)
+ */
 function readPluginConfig(pluginPath: string): { config?: Record<string, unknown>; enabled?: boolean } {
 	const base = pluginPath.replace(/\.(mjs|js|cjs)$/, "");
 	const configPath = `${base}.json`;
 	if (!existsSync(configPath)) return { enabled: true };
 	try {
 		const raw = readFileSync(configPath, "utf-8");
-		return JSON.parse(raw) as { config?: Record<string, unknown>; enabled?: boolean };
+		const parsed = JSON.parse(raw) as Record<string, unknown>;
+		// If "config" key exists, use nested format
+		if (parsed.config && typeof parsed.config === "object") {
+			return { config: parsed.config as Record<string, unknown>, enabled: parsed.enabled as boolean | undefined };
+		}
+		// Flat format: all keys except "enabled" are config
+		const { enabled, ...config } = parsed;
+		return { config, enabled: enabled as boolean | undefined };
 	} catch {
 		return { enabled: true };
 	}
@@ -202,6 +249,27 @@ export async function loadRuntimePlugins(
 	}
 
 	return [...platformToPlugin.values()];
+}
+
+/**
+ * Run the interactive setup() for a plugin at a given path.
+ * Returns the setup result including updated config to persist.
+ * If the plugin has no setup() export, returns success with no config changes.
+ */
+export async function runPluginSetup(pluginPath: string, prompt: SetupPrompt): Promise<SetupResult> {
+	try {
+		const mod = (await import(pluginPath)) as PluginExports;
+		const { config } = readPluginConfig(pluginPath);
+		const ctx: PluginContext = { config: config ?? {} };
+
+		if (!mod.setup) {
+			return { success: true, message: "No setup required" };
+		}
+
+		return await mod.setup(ctx, prompt);
+	} catch (err) {
+		return { success: false, message: `Setup failed: ${err}` };
+	}
 }
 
 /**

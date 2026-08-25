@@ -102,10 +102,15 @@ export class GitHubActionsRuntime implements AgentRuntime {
 
 		// Deploy the workflow and trigger it
 		const token = this.config.token ?? process.env.GITHUB_TOKEN ?? this.getGhToken();
-		const repo = this.config.repo ?? this.detectRepo();
+		// Use config repo (dedicated runs repo) — do NOT fall back to cwd repo.
+		// The setup() flow creates a dedicated private repo for agent runs.
+		const repo = this.config.repo;
 
 		if (!token) throw new Error("No GitHub token. Set GITHUB_TOKEN or run `gh auth login`.");
-		if (!repo) throw new Error("No repo specified. Set repo in config or run from a git repo.");
+		if (!repo)
+			throw new Error(
+				"No repo configured. Run `prime-agent fleet runtimes install github-actions` to set up a dedicated repo.",
+			);
 
 		// Set credentials as GitHub repository secrets (not embedded in YAML)
 		await this.setRepositorySecrets(repo, token, credentialKeys);
@@ -285,21 +290,8 @@ export class GitHubActionsRuntime implements AgentRuntime {
 		}
 	}
 
-	private detectRepo(): string | undefined {
-		try {
-			// Try fork first (user has push access), then origin
-			for (const remoteName of ["fork", "origin"]) {
-				try {
-					const remote = execSync(`git remote get-url ${remoteName}`, { encoding: "utf-8" }).trim();
-					const match = remote.match(/github\.com[:/]([^/]+\/[^/\s]+)/);
-					if (match) return match[1].replace(/\.git$/, "");
-				} catch {}
-			}
-			return undefined;
-		} catch {
-			return undefined;
-		}
-	}
+	// detectRepo() removed — GitHub Actions runtime now requires a dedicated
+	// repo configured via setup(). No more cwd repo fallback.
 
 	private async triggerWorkflow(repo: string, token: string, workflowYaml: string, agentId: string): Promise<number> {
 		// Push workflow to the default branch (required for workflow_dispatch)
@@ -439,4 +431,216 @@ export class GitHubActionsRuntime implements AgentRuntime {
 			return {};
 		}
 	}
+}
+
+// ─── Plugin setup (interactive) ────────────────────────────────────
+
+/**
+ * Interactive setup for the GitHub Actions runtime.
+ *
+ * Flow:
+ * 1. Check `gh auth status` — if not logged in, prompt user to run `gh auth login`
+ * 2. Check for a dedicated repo in config — if missing, offer to create one or use existing
+ * 3. Create a private repo (default: `prime-agent-runs`) if user chooses
+ * 4. Save repo + token to config
+ *
+ * This is called when the user enables/installs the plugin from the fleet menu.
+ * It does NOT use the current working directory's repo — agents need a dedicated
+ * private repo to avoid polluting other repos' config and workflow history.
+ */
+export async function setupGitHubActions(
+	config: Record<string, unknown>,
+	prompt: {
+		ask: (q: string, def?: string) => Promise<string | undefined>;
+		confirm: (q: string, def?: boolean) => Promise<boolean>;
+		choose: (q: string, options: string[]) => Promise<number>;
+		status: (msg: string) => void;
+	},
+): Promise<{ success: boolean; message: string; config?: Record<string, unknown> }> {
+	const newConfig = { ...config };
+
+	// 1. Check gh auth
+	prompt.status("Checking GitHub authentication...");
+	let authed = false;
+	try {
+		const output = execSync("gh auth status 2>&1", {
+			encoding: "utf-8",
+			stdio: ["pipe", "pipe", "pipe"],
+		});
+		// gh auth status may exit non-zero if one account is invalid,
+		// but as long as one account is active, we're authed
+		authed = output.includes("✓ Logged in") && output.includes("Active account: true");
+	} catch (err) {
+		// Check stdout even on failure — gh may exit 1 with valid auth
+		const output = (err as { stdout?: string }).stdout ?? "";
+		authed = output.includes("✓ Logged in") && output.includes("Active account: true");
+	}
+
+	if (!authed) {
+		prompt.status("Not logged in to GitHub. Please run: gh auth login");
+		const confirmed = await prompt.confirm("Open GitHub login in browser? (runs: gh auth login --web)", true);
+		if (confirmed) {
+			prompt.status("Running: gh auth login --web (follow prompts in terminal)...");
+			try {
+				execSync("gh auth login --web", { encoding: "utf-8", stdio: "inherit" });
+				authed = true;
+			} catch {
+				return {
+					success: false,
+					message: "GitHub login failed. Run `gh auth login` manually and retry.",
+				};
+			}
+		} else {
+			return {
+				success: false,
+				message: "GitHub login required. Run `gh auth login` and retry.",
+			};
+		}
+	}
+
+	// 2. Get token
+	let token: string | undefined;
+	try {
+		token = execSync("gh auth token", { encoding: "utf-8" }).trim();
+	} catch {}
+
+	if (!token) {
+		return { success: false, message: "Could not get GitHub token. Run `gh auth login`." };
+	}
+
+	// 3. Check for existing repo in config
+	const existingRepo = newConfig.repo as string | undefined;
+	if (existingRepo) {
+		// Verify repo exists and user has write access
+		prompt.status(`Checking repo ${existingRepo}...`);
+		try {
+			const resp = execSync(`gh repo view ${existingRepo} --json name,visibility,viewerPermission`, {
+				encoding: "utf-8",
+				stdio: ["pipe", "pipe", "pipe"],
+			});
+			const info = JSON.parse(resp) as {
+				name: string;
+				visibility: string;
+				viewerPermission: string;
+			};
+			if (info.viewerPermission === "READ" || info.viewerPermission === "TRIAGE") {
+				const overwrite = await prompt.confirm(
+					`Repo ${existingRepo} is ${info.visibility} with ${info.viewerPermission} access. Use anyway?`,
+					false,
+				);
+				if (!overwrite) {
+					// Fall through to repo selection
+				} else {
+					newConfig.token = token;
+					return {
+						success: true,
+						message: `GitHub Actions runtime configured with repo: ${existingRepo}`,
+						config: newConfig,
+					};
+				}
+			} else {
+				newConfig.token = token;
+				return {
+					success: true,
+					message: `GitHub Actions runtime configured with repo: ${existingRepo} (${info.visibility})`,
+					config: newConfig,
+				};
+			}
+		} catch {
+			prompt.status(`Repo ${existingRepo} not accessible. Let's set up a new one.`);
+		}
+	}
+
+	// 4. Offer: create new private repo, or use existing
+	const choice = await prompt.choose("GitHub Actions needs a dedicated repo for agent runs. What do you want to do?", [
+		"Create a new private repo (recommended)",
+		"Use an existing repo (enter name)",
+	]);
+
+	if (choice === 0) {
+		// Create new private repo
+		const defaultName = "prime-agent-runs";
+		const repoName = await prompt.ask("Repo name:", defaultName);
+		if (!repoName) {
+			return { success: false, message: "Setup cancelled" };
+		}
+
+		// Get username
+		let username: string | undefined;
+		try {
+			username = execSync("gh api user --jq .login", { encoding: "utf-8" }).trim();
+		} catch {
+			return { success: false, message: "Could not get GitHub username. Run `gh auth login`." };
+		}
+
+		const fullRepo = `${username}/${repoName}`;
+		prompt.status(`Creating private repo ${fullRepo}...`);
+
+		try {
+			execSync(`gh repo create ${repoName} --private --description "Prime Agent runtime runs"`, {
+				encoding: "utf-8",
+				stdio: ["pipe", "pipe", "pipe"],
+			});
+		} catch (err) {
+			// Repo might already exist
+			const exists = await prompt.confirm(
+				`Could not create repo (may already exist). Use ${fullRepo} anyway?`,
+				true,
+			);
+			if (!exists) {
+				return { success: false, message: `Repo creation failed: ${err}` };
+			}
+		}
+
+		newConfig.repo = fullRepo;
+		newConfig.token = token;
+		return {
+			success: true,
+			message: `Created private repo ${fullRepo} for GitHub Actions runs`,
+			config: newConfig,
+		};
+	} else if (choice === 1) {
+		// Use existing repo
+		const repoInput = await prompt.ask("Enter repo (owner/name):");
+		if (!repoInput) {
+			return { success: false, message: "Setup cancelled" };
+		}
+
+		// Verify access
+		prompt.status(`Checking repo ${repoInput}...`);
+		try {
+			const resp = execSync(`gh repo view ${repoInput} --json name,visibility,viewerPermission`, {
+				encoding: "utf-8",
+				stdio: ["pipe", "pipe", "pipe"],
+			});
+			const info = JSON.parse(resp) as { visibility: string; viewerPermission: string };
+			if (info.viewerPermission === "READ" || info.viewerPermission === "TRIAGE") {
+				return {
+					success: false,
+					message: `No write access to ${repoInput}. Choose a repo you own or have admin access to.`,
+				};
+			}
+			if (info.visibility === "PUBLIC") {
+				const confirmPublic = await prompt.confirm(
+					`${repoInput} is public. Public repos have unlimited Actions runs but anyone can see workflow files. Continue?`,
+					false,
+				);
+				if (!confirmPublic) {
+					return { success: false, message: "Setup cancelled" };
+				}
+			}
+		} catch {
+			return { success: false, message: `Could not access repo ${repoInput}. Check the name and your access.` };
+		}
+
+		newConfig.repo = repoInput;
+		newConfig.token = token;
+		return {
+			success: true,
+			message: `GitHub Actions runtime configured with repo: ${repoInput}`,
+			config: newConfig,
+		};
+	}
+
+	return { success: false, message: "Setup cancelled" };
 }

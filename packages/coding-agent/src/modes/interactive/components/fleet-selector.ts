@@ -11,6 +11,7 @@
  * All business logic delegates to fleet-operations.ts.
  */
 
+import { createRequire } from "node:module";
 import {
 	Container,
 	type Focusable,
@@ -39,7 +40,10 @@ import {
 import {
 	installRuntimePlugin,
 	listRuntimePlugins,
+	pluginHasSetup,
 	type RuntimePluginInfo,
+	runPluginSetupWithPath,
+	savePluginConfig,
 	toggleRuntimePlugin,
 	uninstallRuntimePlugin,
 } from "../../../cli/fleet/runtime-operations.js";
@@ -446,8 +450,9 @@ export class FleetSelectorComponent extends Container implements Focusable {
 		const actions: { key: string; label: string; desc: string }[] = [];
 
 		if (plugin.source === "template") {
-			actions.push({ key: "i", label: "Install", desc: "Copy to ~/.prime/runtimes/" });
+			actions.push({ key: "i", label: "Install + Setup", desc: "Copy to ~/.prime/runtimes/ and configure" });
 		} else if (plugin.source === "user") {
+			actions.push({ key: "s", label: "Reconfigure", desc: "Run setup again (login, repo, etc.)" });
 			if (plugin.active) {
 				actions.push({ key: "d", label: "Disable", desc: "Disable this plugin" });
 			} else {
@@ -741,6 +746,9 @@ export class FleetSelectorComponent extends Container implements Focusable {
 			case "i":
 				void this.runtimeAction("install", plugin);
 				break;
+			case "s":
+				void this.runtimeAction("reconfigure", plugin);
+				break;
 			case "e":
 				void this.runtimeAction("enable", plugin);
 				break;
@@ -756,13 +764,56 @@ export class FleetSelectorComponent extends Container implements Focusable {
 	private async runtimeAction(action: string, plugin: RuntimePluginInfo): Promise<void> {
 		switch (action) {
 			case "install": {
+				// Install the plugin file first
 				const result = installRuntimePlugin(plugin.name);
-				this.statusText = result.success ? `✓ ${result.message}` : `✗ ${result.message}`;
+				if (!result.success) {
+					this.statusText = `✗ ${result.message}`;
+					break;
+				}
+
+				// Check if the installed plugin has a setup() function
+				const { join } = await import("node:path");
+				const { homedir } = await import("node:os");
+				const pluginPath = join(homedir(), ".prime", "runtimes", `${plugin.name}.mjs`);
+				const hasSetup = await pluginHasSetup(pluginPath);
+
+				if (hasSetup) {
+					// Run interactive setup — uses readline for TUI prompts
+					this.statusText = `Setting up ${plugin.name}...`;
+					this.rebuildChildren();
+
+					const setupResult = await runPluginSetupWithPath(pluginPath, this.createSetupPrompt());
+
+					if (setupResult.success && setupResult.config) {
+						savePluginConfig(plugin.name, setupResult.config);
+					}
+					this.statusText = setupResult.success ? `✓ ${setupResult.message}` : `✗ ${setupResult.message}`;
+				} else {
+					this.statusText = `✓ ${result.message}`;
+				}
 				break;
 			}
 			case "enable": {
 				const result = toggleRuntimePlugin(plugin.name, true);
 				this.statusText = result.success ? `✓ ${result.message}` : `✗ ${result.message}`;
+				break;
+			}
+			case "reconfigure": {
+				const { join } = await import("node:path");
+				const { homedir } = await import("node:os");
+				const pluginPath = join(homedir(), ".prime", "runtimes", `${plugin.name}.mjs`);
+				const hasSetup = await pluginHasSetup(pluginPath);
+				if (!hasSetup) {
+					this.statusText = `${plugin.name} has no setup flow`;
+					break;
+				}
+				this.statusText = `Reconfiguring ${plugin.name}...`;
+				this.rebuildChildren();
+				const setupResult = await runPluginSetupWithPath(pluginPath, this.createSetupPrompt());
+				if (setupResult.success && setupResult.config) {
+					savePluginConfig(plugin.name, setupResult.config);
+				}
+				this.statusText = setupResult.success ? `✓ ${setupResult.message}` : `✗ ${setupResult.message}`;
 				break;
 			}
 			case "disable": {
@@ -781,6 +832,52 @@ export class FleetSelectorComponent extends Container implements Focusable {
 		this._selectedRuntime = null;
 		this._runtimePlugins = await listRuntimePlugins();
 		this.rebuildChildren();
+	}
+
+	/** Create a SetupPrompt implementation using readline for terminal I/O. */
+	private createSetupPrompt() {
+		const req = createRequire(import.meta.url);
+		const { createInterface } = req("node:readline") as typeof import("node:readline");
+		const rl = createInterface({ input: process.stdin, output: process.stdout });
+
+		const ask = (q: string, def?: string): Promise<string | undefined> =>
+			new Promise((resolve) => {
+				const prompt = def ? `${q} [${def}]: ` : `${q}: `;
+				rl.question(prompt, (answer: string) => {
+					const trimmed = answer.trim();
+					if (!trimmed && def) return resolve(def);
+					resolve(trimmed || undefined);
+				});
+			});
+
+		const confirm = (q: string, def?: boolean): Promise<boolean> =>
+			new Promise((resolve) => {
+				const hint = def ? "Y/n" : "y/N";
+				rl.question(`${q} [${hint}]: `, (answer: string) => {
+					const a = answer.trim().toLowerCase();
+					if (!a) return resolve(def ?? false);
+					resolve(a === "y" || a === "yes");
+				});
+			});
+
+		const choose = (q: string, options: string[]): Promise<number> =>
+			new Promise((resolve) => {
+				console.log(`\n${q}`);
+				options.forEach((opt, i) => {
+					console.log(`  ${i + 1}. ${opt}`);
+				});
+				rl.question(`Choose (1-${options.length}): `, (answer: string) => {
+					const n = Number.parseInt(answer.trim(), 10);
+					if (n >= 1 && n <= options.length) return resolve(n - 1);
+					resolve(-1);
+				});
+			});
+
+		const status = (msg: string) => {
+			console.log(`  ${msg}`);
+		};
+
+		return { ask, confirm, choose, status };
 	}
 
 	private async confirmRename(newName: string): Promise<void> {

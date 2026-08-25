@@ -27,21 +27,25 @@ const outDir = join(packageDir, "dist", "plugins", "runtimes");
 // Templates for those are generated to dist/plugins/templates/ for users/agents
 // to copy into ~/.prime/runtimes/ when needed.
 const builtInRuntimes = [
-	{ name: "ssh", entry: "ssh-runtime.ts" },
+	{ name: "ssh", entry: "ssh-runtime.ts", setupExport: null },
 ];
 
 const templateRuntimes = [
-	{ name: "cloudflare", entry: "cloudflare-runtime.ts" },
-	{ name: "github-actions", entry: "github-actions-runtime.ts" },
+	{ name: "cloudflare", entry: "cloudflare-runtime.ts", setupExport: "setupCloudflare" },
+	{ name: "github-actions", entry: "github-actions-runtime.ts", setupExport: "setupGitHubActions" },
 ];
 
 rmSync(outDir, { recursive: true, force: true });
 mkdirSync(outDir, { recursive: true });
 
 // 1. Build built-in plugins (only SSH)
-for (const { name, entry } of builtInRuntimes) {
+for (const { name, entry, setupExport } of builtInRuntimes) {
 	const entryPath = join(packageDir, "src", "core", "fleet-runtime", entry);
 	const outFile = join(outDir, `${name}.mjs`);
+
+	// esbuild bundles everything into one file — the setup function is already
+	// included. We just need to re-export it with the name `setup`.
+	const setupLine = setupExport ? `export { ${setupExport} as setup };` : "";
 
 	await build({
 		entryPoints: [entryPath],
@@ -57,6 +61,7 @@ for (const { name, entry } of builtInRuntimes) {
 export function createRuntime({ config }) {
   return new ${className(name)}(config);
 }
+${setupLine}
 `,
 		},
 		logLevel: "warning",
@@ -70,9 +75,11 @@ export function createRuntime({ config }) {
 const templateDir = join(packageDir, "dist", "plugins", "templates");
 mkdirSync(templateDir, { recursive: true });
 
-for (const { name, entry } of templateRuntimes) {
+for (const { name, entry, setupExport } of templateRuntimes) {
 	const entryPath = join(packageDir, "src", "core", "fleet-runtime", entry);
 	const outFile = join(templateDir, `${name}.mjs`);
+
+	const setupLine = setupExport ? `export { ${setupExport} as setup };` : "";
 
 	await build({
 		entryPoints: [entryPath],
@@ -88,6 +95,7 @@ for (const { name, entry } of templateRuntimes) {
 export function createRuntime({ config }) {
   return new ${className(name)}(config);
 }
+${setupLine}
 `,
 		},
 		logLevel: "warning",

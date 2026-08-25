@@ -476,9 +476,75 @@ async function runtimesCmd(args: string[]): Promise<void> {
 			return;
 		}
 		const result = installRuntimePlugin(name);
-		if (result.success) console.log(chalk.green(`✓ ${result.message}`));
-		else console.error(chalk.red(result.message));
-		process.exitCode = result.success ? 0 : 1;
+		if (!result.success) {
+			console.error(chalk.red(result.message));
+			process.exitCode = 1;
+			return;
+		}
+		console.log(chalk.green(`✓ ${result.message}`));
+
+		// Check if plugin has setup() and run it interactively
+		const { join } = await import("node:path");
+		const { homedir } = await import("node:os");
+		const { pluginHasSetup, runPluginSetupWithPath, savePluginConfig } = await import("./runtime-operations.js");
+		const pluginPath = join(homedir(), ".prime", "runtimes", `${name}.mjs`);
+		const hasSetup = await pluginHasSetup(pluginPath);
+		if (hasSetup) {
+			console.log(chalk.dim(`\n  Running setup for ${name}...`));
+			const { createInterface } = await import("node:readline");
+			const rl = createInterface({ input: process.stdin, output: process.stdout });
+			// Handle EOF — resolve pending question with undefined
+			let eofResolve: ((val: unknown) => void) | null = null;
+			rl.on("close", () => {
+				if (eofResolve) eofResolve(undefined);
+			});
+			const prompt = {
+				ask: (q: string, def?: string) =>
+					new Promise<string | undefined>((resolve) => {
+						eofResolve = resolve as (val: unknown) => void;
+						rl.question(def ? `${q} [${def}]: ` : `${q}: `, (answer) => {
+							eofResolve = null;
+							const t = answer.trim();
+							resolve(t || def);
+						});
+					}),
+				confirm: (q: string, def?: boolean) =>
+					new Promise<boolean>((resolve) => {
+						eofResolve = resolve as (val: unknown) => void;
+						rl.question(`${q} [${def ? "Y/n" : "y/N"}]: `, (answer) => {
+							eofResolve = null;
+							const a = answer.trim().toLowerCase();
+							resolve(!a ? (def ?? false) : a === "y" || a === "yes");
+						});
+					}),
+				choose: (q: string, options: string[]) =>
+					new Promise<number>((resolve) => {
+						eofResolve = resolve as (val: unknown) => void;
+						console.log(`\n${q}`);
+						options.forEach((opt, i) => {
+							console.log(`  ${i + 1}. ${opt}`);
+						});
+						rl.question(`Choose (1-${options.length}): `, (answer) => {
+							eofResolve = null;
+							const n = Number.parseInt(answer.trim(), 10);
+							resolve(n >= 1 && n <= options.length ? n - 1 : -1);
+						});
+					}),
+				status: (msg: string) => console.log(chalk.dim(`  ${msg}`)),
+			};
+			const setupResult = await runPluginSetupWithPath(pluginPath, prompt);
+			rl.close();
+			if (setupResult.success) {
+				console.log(chalk.green(`✓ ${setupResult.message}`));
+				if (setupResult.config) {
+					savePluginConfig(name, setupResult.config);
+					console.log(chalk.dim(`  Config saved to ~/.prime/runtimes/${name}.json`));
+				}
+			} else {
+				console.error(chalk.red(`✗ ${setupResult.message}`));
+				process.exitCode = 1;
+			}
+		}
 		return;
 	}
 
