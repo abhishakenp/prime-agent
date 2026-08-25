@@ -11,6 +11,8 @@ import { dirname, join } from "node:path";
 export interface FleetHost {
 	/** Unique hostname identifier. */
 	hostname: string;
+	/** Custom display name (rename). */
+	displayName?: string;
 	/** SSH alias or IP address for SSH access. */
 	address: string;
 	/** SSH user (defaults to current user). */
@@ -95,4 +97,31 @@ export async function updateFleetHostStatus(
 		host.lastSeen = lastSeen ?? Date.now();
 		await saveFleetConfig(config);
 	}
+}
+
+export async function renameFleetHost(hostname: string, displayName: string): Promise<boolean> {
+	const config = await loadFleetConfig();
+	const host = config.hosts.find((h) => h.hostname === hostname);
+	if (!host) return false;
+	host.displayName = displayName;
+	await saveFleetConfig(config);
+	return true;
+}
+
+export async function addFleetHostTag(hostname: string, tag: string): Promise<boolean> {
+	const config = await loadFleetConfig();
+	const host = config.hosts.find((h) => h.hostname === hostname);
+	if (!host) return false;
+	host.tags = [...new Set([...host.tags, tag])];
+	await saveFleetConfig(config);
+	return true;
+}
+
+export async function removeFleetHostTag(hostname: string, tag: string): Promise<boolean> {
+	const config = await loadFleetConfig();
+	const host = config.hosts.find((h) => h.hostname === hostname);
+	if (!host) return false;
+	host.tags = host.tags.filter((t) => t !== tag);
+	await saveFleetConfig(config);
+	return true;
 }

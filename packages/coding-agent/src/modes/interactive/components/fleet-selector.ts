@@ -26,9 +26,11 @@ import { bootstrapHost, checkHostStatus, disconnectHost } from "../../../cli/fle
 import { type DiscoveredDevice, discoverStream, inferTags } from "../../../cli/fleet/discovery.js";
 import {
 	addFleetHost,
+	addFleetHostTag,
 	type FleetHost,
 	listFleetHosts,
 	removeFleetHost,
+	renameFleetHost,
 	updateFleetHostStatus,
 } from "../../../cli/fleet/fleet-config.js";
 import { theme } from "../theme/theme.js";
@@ -62,6 +64,10 @@ export class FleetSelectorComponent extends Container implements Focusable {
 	private checkedSet = new Set<string>();
 	private statusText = "";
 	private isLoading = false;
+	private _renaming = false;
+	private _renameTarget = "";
+	private _tagging = false;
+	private _tagTarget = "";
 	private readonly onDone: () => void;
 	private readonly requestRender: () => void;
 
@@ -242,9 +248,10 @@ export class FleetSelectorComponent extends Container implements Focusable {
 		// Checkbox
 		const checkbox = isChecked ? theme.fg("success", "[✓]") : theme.fg("dim", "[ ]");
 
-		// Hostname with color
+		// Display name — use displayName if set, otherwise hostname
+		const displayName = entry.fleetHost?.displayName ?? entry.hostname;
 		const hostnameColor = entry.inFleet ? "accent" : entry.online ? "text" : "dim";
-		const hostname = theme.fg(hostnameColor, truncateToWidth(entry.hostname, 22, ""));
+		const hostname = theme.fg(hostnameColor, truncateToWidth(displayName, 22, ""));
 
 		// OS badge
 		const osBadge = entry.os ? this.formatOsBadge(entry.os) : "";
@@ -255,7 +262,7 @@ export class FleetSelectorComponent extends Container implements Focusable {
 		// Cursor prefix
 		const prefix = isSelected ? theme.fg("accent", "›") : " ";
 
-		const padding = " ".repeat(Math.max(1, 24 - visibleWidth(entry.hostname)));
+		const padding = " ".repeat(Math.max(1, 24 - visibleWidth(displayName)));
 		const row = `${prefix} ${checkbox} ${hostname}${padding}${osBadge} ${badges}`;
 		this.addChild(new Text(row, 1, 0));
 	}
@@ -303,8 +310,11 @@ export class FleetSelectorComponent extends Container implements Focusable {
 			},
 			{ key: "c", label: "Connect", desc: "Mark as connected" },
 			{ key: "d", label: "Disconnect", desc: "Stop daemon on host" },
+			{ key: "e", label: "SSH", desc: "Open SSH session" },
 		];
 		if (entry.inFleet) {
+			actions.push({ key: "n", label: "Rename", desc: "Set custom display name" });
+			actions.push({ key: "t", label: "Add tag", desc: "Tag this host" });
 			actions.push({ key: "x", label: "Remove from fleet", desc: "Unregister this host" });
 		} else {
 			actions.push({ key: "a", label: "Add to fleet", desc: `Tags: ${entry.tags.join(", ")}` });
@@ -335,6 +345,30 @@ export class FleetSelectorComponent extends Container implements Focusable {
 
 	handleInput(data: string): void {
 		const kb = getKeybindings();
+
+		// Rename/tag input mode — capture text, Enter confirms, Esc cancels
+		if (this._renaming || this._tagging) {
+			if (kb.matches(data, "tui.select.confirm")) {
+				const value = this.searchInput.getValue().trim();
+				if (this._renaming && value) {
+					void this.confirmRename(value);
+				} else if (this._tagging && value) {
+					void this.confirmTag(value);
+				}
+				return;
+			}
+			if (kb.matches(data, "tui.select.cancel")) {
+				this._renaming = false;
+				this._tagging = false;
+				this.searchInput.setValue("");
+				this.statusText = "";
+				this.rebuildChildren();
+				return;
+			}
+			this.searchInput.handleInput(data);
+			this.rebuildChildren();
+			return;
+		}
 
 		if (this.currentView === "host-actions") {
 			this.handleHostActionsInput(data);
@@ -445,7 +479,38 @@ export class FleetSelectorComponent extends Container implements Focusable {
 			case "a":
 				void this.hostAction("add");
 				break;
+			case "n":
+				void this.hostAction("rename");
+				break;
+			case "t":
+				void this.hostAction("tag");
+				break;
+			case "e":
+				void this.hostAction("ssh");
+				break;
 		}
+	}
+
+	private async confirmRename(newName: string): Promise<void> {
+		const hostname = this._renameTarget;
+		this._renaming = false;
+		this.searchInput.setValue("");
+		await renameFleetHost(hostname, newName);
+		this.statusText = `Renamed ${hostname} -> ${newName}`;
+		this.currentView = "main";
+		this.selectedEntry = null;
+		await this.autoDiscover();
+	}
+
+	private async confirmTag(tag: string): Promise<void> {
+		const hostname = this._tagTarget;
+		this._tagging = false;
+		this.searchInput.setValue("");
+		await addFleetHostTag(hostname, tag);
+		this.statusText = `Tagged ${hostname} with ${tag}`;
+		this.currentView = "main";
+		this.selectedEntry = null;
+		await this.autoDiscover();
 	}
 
 	// ─── Actions ──────────────────────────────────────────────────────
@@ -600,6 +665,44 @@ export class FleetSelectorComponent extends Container implements Focusable {
 				this.currentView = "main";
 				this.selectedEntry = null;
 				await this.autoDiscover();
+				break;
+			}
+			case "rename": {
+				if (!entry.inFleet) {
+					this.statusText = `Add ${entry.hostname} to fleet first to rename`;
+					this.rebuildChildren();
+					break;
+				}
+				this.searchInput.setValue("");
+				this.statusText = `Enter new name for ${entry.hostname} (Enter to confirm, Esc to cancel):`;
+				this.rebuildChildren();
+				this._renameTarget = entry.hostname;
+				this._renaming = true;
+				break;
+			}
+			case "tag": {
+				if (!entry.inFleet) {
+					this.statusText = `Add ${entry.hostname} to fleet first to tag`;
+					this.rebuildChildren();
+					break;
+				}
+				this.searchInput.setValue("");
+				this.statusText = `Enter tag for ${entry.hostname} (Enter to add, Esc to cancel):`;
+				this.rebuildChildren();
+				this._tagTarget = entry.hostname;
+				this._tagging = true;
+				break;
+			}
+			case "ssh": {
+				const target = entry.address;
+				this.statusText = `SSH to ${target}...`;
+				this.rebuildChildren();
+				const { spawn } = await import("node:child_process");
+				const ssh = spawn("ssh", [target], { stdio: "inherit" });
+				ssh.on("exit", () => {
+					this.statusText = `SSH session ended`;
+					this.rebuildChildren();
+				});
 				break;
 			}
 		}

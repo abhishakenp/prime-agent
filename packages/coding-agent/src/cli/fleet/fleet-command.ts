@@ -7,8 +7,12 @@
  *   prime-agent fleet discover           Scan network for accessible devices
  *   prime-agent fleet add <host>         Add a host to the fleet
  *   prime-agent fleet remove <host>      Remove a host from the fleet
+ *   prime-agent fleet rename <host> <name>  Rename a host in the fleet
+ *   prime-agent fleet tag <host> <tag>      Add a tag to a host
+ *   prime-agent fleet untag <host> <tag>    Remove a tag from a host
  *   prime-agent fleet connect <host>     Connect a host to the gateway
  *   prime-agent fleet disconnect <host>  Disconnect a host from the gateway
+ *   prime-agent fleet ssh <host>         SSH into a host
  *   prime-agent fleet status <host>      Check a host's status
  *   prime-agent fleet bootstrap <host>   Install pi on a host and add to fleet
  */
@@ -18,10 +22,13 @@ import { bootstrapHost, checkHostStatus, disconnectHost } from "./bootstrap.js";
 import { discoverDevices, discoverDevicesQuick, inferTags } from "./discovery.js";
 import {
 	addFleetHost,
+	addFleetHostTag,
 	type FleetHost,
 	getFleetHost,
 	listFleetHosts,
 	removeFleetHost,
+	removeFleetHostTag,
+	renameFleetHost,
 	updateFleetHostStatus,
 } from "./fleet-config.js";
 
@@ -31,8 +38,12 @@ type FleetSubcommand =
 	| "add"
 	| "remove"
 	| "rm"
+	| "rename"
+	| "tag"
+	| "untag"
 	| "connect"
 	| "disconnect"
+	| "ssh"
 	| "status"
 	| "bootstrap"
 	| undefined;
@@ -58,11 +69,23 @@ export async function handleFleetCommand(args: string[]): Promise<void> {
 		case "rm":
 			await removeHost(rest);
 			break;
+		case "rename":
+			await renameHost(rest);
+			break;
+		case "tag":
+			await tagHost(rest);
+			break;
+		case "untag":
+			await untagHost(rest);
+			break;
 		case "connect":
 			await connectHost(rest);
 			break;
 		case "disconnect":
 			await disconnectHostCmd(rest);
+			break;
+		case "ssh":
+			await sshHost(rest);
 			break;
 		case "status":
 			await statusHost(rest);
@@ -95,16 +118,20 @@ async function listFleet(args: string[]): Promise<void> {
 
 	console.log(chalk.bold("\n  Fleet Hosts\n"));
 	console.log(
-		`  ${"HOSTNAME".padEnd(20)} ${"ADDRESS".padEnd(20)} ${"TAGS".padEnd(20)} ${"STATUS".padEnd(12)} ${"PI VERSION"}`,
+		`  ${"NAME".padEnd(20)} ${"HOSTNAME".padEnd(20)} ${"ADDRESS".padEnd(20)} ${"TAGS".padEnd(20)} ${"STATUS".padEnd(12)} ${"PI"}`,
 	);
-	console.log(`  ${"─".repeat(20)} ${"─".repeat(20)} ${"─".repeat(20)} ${"─".repeat(12)} ${"─".repeat(10)}`);
+	console.log(
+		`  ${"─".repeat(20)} ${"─".repeat(20)} ${"─".repeat(20)} ${"─".repeat(20)} ${"─".repeat(12)} ${"─".repeat(10)}`,
+	);
 
 	for (const host of hosts) {
 		const status = host.lastStatus ?? "unknown";
 		const statusColor = status === "connected" ? chalk.green : status === "disconnected" ? chalk.yellow : chalk.dim;
 		const tags = host.tags.join(",") || "-";
+		const name = host.displayName ?? host.hostname;
+		const nameCol = host.displayName ? chalk.cyan(name) : name;
 		console.log(
-			`  ${host.hostname.padEnd(20)} ${host.address.padEnd(20)} ${tags.padEnd(20)} ${statusColor(status.padEnd(12))} ${host.piVersion ?? "-"}`,
+			`  ${nameCol.padEnd(20)} ${host.hostname.padEnd(20)} ${host.address.padEnd(20)} ${tags.padEnd(20)} ${statusColor(status.padEnd(12))} ${host.piVersion ?? "-"}`,
 		);
 	}
 	console.log();
@@ -200,9 +227,9 @@ async function addHost(args: string[]): Promise<void> {
 		return;
 	}
 
-	// Probe the host
+	// Probe the host — use quick discovery (Tailscale + ARP cache, no ping sweep)
 	console.log(chalk.dim(`Probing ${hostname}...`));
-	const devices = await discoverDevices({});
+	const devices = await discoverDevicesQuick();
 	const device = devices.find((d) => d.hostname.toLowerCase() === hostname.toLowerCase());
 
 	const host: FleetHost = {
@@ -246,6 +273,81 @@ async function removeHost(args: string[]): Promise<void> {
 		console.error(chalk.red(`Host "${hostname}" not found in fleet.`));
 		process.exitCode = 1;
 	}
+}
+
+// ─── rename ────────────────────────────────────────────────────────
+
+async function renameHost(args: string[]): Promise<void> {
+	const [hostname, ...nameParts] = args;
+	const displayName = nameParts.join(" ").trim();
+	if (!hostname || !displayName) {
+		console.error(chalk.red("Usage: prime-agent fleet rename <hostname> <new-name>"));
+		process.exitCode = 1;
+		return;
+	}
+	const ok = await renameFleetHost(hostname, displayName);
+	if (ok) {
+		console.log(chalk.green(`✓ Renamed "${hostname}" → "${displayName}".`));
+	} else {
+		console.error(
+			chalk.red(`Host "${hostname}" not found in fleet. Add it first: prime-agent fleet add ${hostname}`),
+		);
+		process.exitCode = 1;
+	}
+}
+
+// ─── tag / untag ────────────────────────────────────────────────────
+
+async function tagHost(args: string[]): Promise<void> {
+	const [hostname, tag] = args;
+	if (!hostname || !tag) {
+		console.error(chalk.red("Usage: prime-agent fleet tag <hostname> <tag>"));
+		process.exitCode = 1;
+		return;
+	}
+	const ok = await addFleetHostTag(hostname, tag);
+	if (ok) {
+		console.log(chalk.green(`✓ Tagged "${hostname}" with "${tag}".`));
+	} else {
+		console.error(chalk.red(`Host "${hostname}" not found in fleet.`));
+		process.exitCode = 1;
+	}
+}
+
+async function untagHost(args: string[]): Promise<void> {
+	const [hostname, tag] = args;
+	if (!hostname || !tag) {
+		console.error(chalk.red("Usage: prime-agent fleet untag <hostname> <tag>"));
+		process.exitCode = 1;
+		return;
+	}
+	const ok = await removeFleetHostTag(hostname, tag);
+	if (ok) {
+		console.log(chalk.green(`✓ Removed tag "${tag}" from "${hostname}".`));
+	} else {
+		console.error(chalk.red(`Host "${hostname}" not found in fleet.`));
+		process.exitCode = 1;
+	}
+}
+
+// ─── ssh ────────────────────────────────────────────────────────────
+
+async function sshHost(args: string[]): Promise<void> {
+	const hostname = args[0];
+	if (!hostname) {
+		console.error(chalk.red("Usage: prime-agent fleet ssh <hostname>"));
+		process.exitCode = 1;
+		return;
+	}
+	const host = await getFleetHost(hostname);
+	const target = host?.address ?? hostname;
+	const user = host?.user ? `${host.user}@` : "";
+	console.log(chalk.dim(`Connecting to ${user || ""}${target}...`));
+	const { spawn } = await import("node:child_process");
+	const ssh = spawn("ssh", [`${user}${target}`], { stdio: "inherit" });
+	ssh.on("exit", (code) => {
+		if (code) process.exitCode = code;
+	});
 }
 
 // ─── connect ───────────────────────────────────────────────────────
