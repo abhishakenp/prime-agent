@@ -173,6 +173,26 @@ async function discoverSshConfig(): Promise<DiscoveredDevice[]> {
 
 // ─── Known hosts ───────────────────────────────────────────────────
 
+/** Hostnames that are clearly not fleet devices (Git hosts, CI, registries, etc.) */
+const NON_DEVICE_HOSTS = new Set([
+	"github.com",
+	"bitbucket.org",
+	"gitlab.com",
+	"ssh.dev.azure.com",
+	"vs-ssh.visualstudio.com",
+	"registry.npmjs.org",
+	"npm.pkg.github.com",
+	"pypi.org",
+	"crates.io",
+	"docker.io",
+	"index.docker.io",
+	"ghcr.io",
+	"gcr.io",
+	"amazonaws.com",
+	"cloudflare.com",
+	"workers.dev",
+]);
+
 async function discoverKnownHosts(): Promise<DiscoveredDevice[]> {
 	const path = join(homedir(), ".ssh", "known_hosts");
 	let content: string;
@@ -188,15 +208,17 @@ async function discoverKnownHosts(): Promise<DiscoveredDevice[]> {
 	for (const line of content.split("\n")) {
 		const host = line.trim().split(/\s+/)[0];
 		if (!host || host.startsWith("#") || host === "*") continue;
-		// Skip hashed entries
-		if (host.startsWith("|")) continue;
-		// Handle comma-separated hosts
+		if (host.startsWith("|")) continue; // hashed
 		for (const h of host.split(",")) {
 			const clean = h.trim();
 			if (!clean || seen.has(clean)) continue;
 			seen.add(clean);
-			// Skip raw IPs that are likely Tailscale (100.x.x.x) — those come from Tailscale source
+			// Skip Tailscale IPs (100.x.x.x) — come from Tailscale source
 			if (/^100\.\d+\.\d+\.\d+$/.test(clean)) continue;
+			// Skip known non-device hosts (GitHub, Bitbucket, etc.)
+			if (NON_DEVICE_HOSTS.has(clean.toLowerCase())) continue;
+			// Skip bare IPs that aren't Tailscale — not useful as fleet hosts
+			if (/^\d+\.\d+\.\d+\.\d+$/.test(clean) && !clean.startsWith("100.")) continue;
 			devices.push({
 				hostname: clean,
 				source: "known-hosts",
@@ -248,12 +270,38 @@ async function discoverArp(): Promise<DiscoveredDevice[]> {
 
 function mergeDevices(devices: DiscoveredDevice[]): DiscoveredDevice[] {
 	const byHostname = new Map<string, DiscoveredDevice>();
+	// Track short names to deduplicate Tailscale FQDNs (a2 vs a2.tail98d74a.ts.net)
+	const shortNameToKey = new Map<string, string>();
 
 	for (const device of devices) {
 		const key = device.hostname.toLowerCase();
+
+		// If this is a Tailscale FQDN (xxx.tailXXXX.ts.net), check if short name already exists
+		const tsMatch = /^([^.]+)\..*\.ts\.net$/.exec(key);
+		if (tsMatch) {
+			const shortName = tsMatch[1];
+			if (shortNameToKey.has(shortName)) {
+				continue;
+			}
+		}
+
+		// If this is a short name and a FQDN version exists, replace it
+		const existingFqdnKey = Array.from(byHostname.keys()).find(
+			(k) => k.startsWith(`${key}.`) && k.endsWith(".ts.net"),
+		);
+		if (existingFqdnKey) {
+			byHostname.delete(existingFqdnKey);
+		}
+
 		const existing = byHostname.get(key);
 		if (!existing) {
 			byHostname.set(key, { ...device });
+			const shortMatch = /^([^.]+)\..*\.ts\.net$/.exec(key);
+			if (shortMatch) {
+				shortNameToKey.set(shortMatch[1], key);
+			} else {
+				shortNameToKey.set(key, key);
+			}
 			continue;
 		}
 		// Merge: prefer Tailscale source, then ssh-config, then known-hosts, then arp
@@ -261,13 +309,10 @@ function mergeDevices(devices: DiscoveredDevice[]): DiscoveredDevice[] {
 		if (priority[device.source] > priority[existing.source]) {
 			byHostname.set(key, {
 				...device,
-				// Keep any tags from existing
 				tags: [...new Set([...device.tags, ...existing.tags])],
-				// Keep sshAlias if existing had one
 				sshAlias: device.sshAlias ?? existing.sshAlias,
 			});
 		} else {
-			// Enrich existing with new info
 			existing.tags = [...new Set([...existing.tags, ...device.tags])];
 			if (!existing.sshAlias && device.sshAlias) existing.sshAlias = device.sshAlias;
 			if (!existing.tailscaleIp && device.tailscaleIp) existing.tailscaleIp = device.tailscaleIp;
