@@ -461,7 +461,8 @@ async function runtimesCmd(args: string[]): Promise<void> {
 				p.source === "builtin" ? chalk.cyan(p.name) : p.source === "user" ? chalk.green(p.name) : chalk.dim(p.name);
 			console.log(`  ${name.padEnd(18)} ${p.source.padEnd(10)} ${status.padEnd(10)} ${config.padEnd(8)} ${size}`);
 		}
-		console.log(chalk.dim(`\n  Install: prime-agent fleet runtimes install <name>`));
+		console.log(chalk.dim(`\n  Install: prime-agent fleet runtimes install <name> [--no-setup] [--config k=v]`));
+		console.log(chalk.dim(`  Setup:   prime-agent fleet runtimes setup <name> [--config k=v]`));
 		console.log(chalk.dim(`  Enable:  prime-agent fleet runtimes enable <name>`));
 		console.log(chalk.dim(`  Disable: prime-agent fleet runtimes disable <name>`));
 		console.log(chalk.dim(`  Config:  prime-agent fleet runtimes config <name> <key> <value>\n`));
@@ -471,10 +472,30 @@ async function runtimesCmd(args: string[]): Promise<void> {
 	if (action === "install") {
 		const name = args[1];
 		if (!name) {
-			console.error(chalk.red("Usage: prime-agent fleet runtimes install <name>"));
+			console.error(
+				chalk.red("Usage: prime-agent fleet runtimes install <name> [--no-setup] [--config key=value...]"),
+			);
 			process.exitCode = 1;
 			return;
 		}
+		const noSetup = args.includes("--no-setup");
+		const configArgs = args.filter((a) => a.startsWith("--config=") || a === "--config");
+		const inlineConfig: Record<string, unknown> = {};
+		for (const ca of configArgs) {
+			if (ca === "--config") continue;
+			const kv = ca.slice("--config=".length);
+			const eq = kv.indexOf("=");
+			if (eq > 0) {
+				const key = kv.slice(0, eq);
+				let val: unknown = kv.slice(eq + 1);
+				// Try to parse JSON values (numbers, booleans, null)
+				try {
+					val = JSON.parse(val as string);
+				} catch {}
+				inlineConfig[key] = val;
+			}
+		}
+
 		const result = installRuntimePlugin(name);
 		if (!result.success) {
 			console.error(chalk.red(result.message));
@@ -483,7 +504,19 @@ async function runtimesCmd(args: string[]): Promise<void> {
 		}
 		console.log(chalk.green(`✓ ${result.message}`));
 
-		// Check if plugin has setup() and run it interactively
+		// Save inline config if provided (agent-friendly, no prompts)
+		if (Object.keys(inlineConfig).length > 0) {
+			const { savePluginConfig } = await import("./runtime-operations.js");
+			savePluginConfig(name, inlineConfig);
+			console.log(chalk.dim(`  Config saved: ${JSON.stringify(inlineConfig)}`));
+		}
+
+		// Run interactive setup unless --no-setup or inline config was provided
+		if (noSetup || Object.keys(inlineConfig).length > 0) {
+			if (noSetup) console.log(chalk.dim("  Skipped setup (--no-setup)"));
+			return;
+		}
+
 		const { join } = await import("node:path");
 		const { homedir } = await import("node:os");
 		const { pluginHasSetup, runPluginSetupWithPath, savePluginConfig } = await import("./runtime-operations.js");
@@ -493,7 +526,6 @@ async function runtimesCmd(args: string[]): Promise<void> {
 			console.log(chalk.dim(`\n  Running setup for ${name}...`));
 			const { createInterface } = await import("node:readline");
 			const rl = createInterface({ input: process.stdin, output: process.stdout });
-			// Handle EOF — resolve pending question with undefined
 			let eofResolve: ((val: unknown) => void) | null = null;
 			rl.on("close", () => {
 				if (eofResolve) eofResolve(undefined);
@@ -544,6 +576,102 @@ async function runtimesCmd(args: string[]): Promise<void> {
 				console.error(chalk.red(`✗ ${setupResult.message}`));
 				process.exitCode = 1;
 			}
+		}
+		return;
+	}
+
+	if (action === "setup") {
+		const name = args[1];
+		if (!name) {
+			console.error(chalk.red("Usage: prime-agent fleet runtimes setup <name> [--config key=value...]"));
+			process.exitCode = 1;
+			return;
+		}
+		const { join } = await import("node:path");
+		const { homedir } = await import("node:os");
+		const { pluginHasSetup, runPluginSetupWithPath, savePluginConfig } = await import("./runtime-operations.js");
+		const pluginPath = join(homedir(), ".prime", "runtimes", `${name}.mjs`);
+		const hasSetup = await pluginHasSetup(pluginPath);
+		if (!hasSetup) {
+			console.log(chalk.dim(`${name} has no setup flow`));
+			return;
+		}
+
+		// Check for inline config (non-interactive mode)
+		const configArgs = args.filter((a) => a.startsWith("--config="));
+		if (configArgs.length > 0) {
+			// Non-interactive: save config directly, skip prompts
+			const inlineConfig: Record<string, unknown> = {};
+			for (const ca of configArgs) {
+				const kv = ca.slice("--config=".length);
+				const eq = kv.indexOf("=");
+				if (eq > 0) {
+					const key = kv.slice(0, eq);
+					let val: unknown = kv.slice(eq + 1);
+					try {
+						val = JSON.parse(val as string);
+					} catch {}
+					inlineConfig[key] = val;
+				}
+			}
+			savePluginConfig(name, inlineConfig);
+			console.log(chalk.green(`✓ Configured ${name}: ${JSON.stringify(inlineConfig)}`));
+			return;
+		}
+
+		// Interactive setup
+		console.log(chalk.dim(`\n  Running setup for ${name}...`));
+		const { createInterface } = await import("node:readline");
+		const rl = createInterface({ input: process.stdin, output: process.stdout });
+		let eofResolve: ((val: unknown) => void) | null = null;
+		rl.on("close", () => {
+			if (eofResolve) eofResolve(undefined);
+		});
+		const prompt = {
+			ask: (q: string, def?: string) =>
+				new Promise<string | undefined>((resolve) => {
+					eofResolve = resolve as (val: unknown) => void;
+					rl.question(def ? `${q} [${def}]: ` : `${q}: `, (answer) => {
+						eofResolve = null;
+						const t = answer.trim();
+						resolve(t || def);
+					});
+				}),
+			confirm: (q: string, def?: boolean) =>
+				new Promise<boolean>((resolve) => {
+					eofResolve = resolve as (val: unknown) => void;
+					rl.question(`${q} [${def ? "Y/n" : "y/N"}]: `, (answer) => {
+						eofResolve = null;
+						const a = answer.trim().toLowerCase();
+						resolve(!a ? (def ?? false) : a === "y" || a === "yes");
+					});
+				}),
+			choose: (q: string, options: string[]) =>
+				new Promise<number>((resolve) => {
+					eofResolve = resolve as (val: unknown) => void;
+					console.log(`\n${q}`);
+					options.forEach((opt, i) => {
+						console.log(`  ${i + 1}. ${opt}`);
+					});
+					rl.question(`Choose (1-${options.length}): `, (answer) => {
+						eofResolve = null;
+						const n = Number.parseInt(answer.trim(), 10);
+						resolve(n >= 1 && n <= options.length ? n - 1 : -1);
+					});
+				}),
+			status: (msg: string) => console.log(chalk.dim(`  ${msg}`)),
+		};
+		const setupResult = await runPluginSetupWithPath(pluginPath, prompt);
+		rl.close();
+		if (setupResult.success) {
+			console.log(chalk.green(`✓ ${setupResult.message}`));
+			if (setupResult.config) {
+				savePluginConfig(name, setupResult.config);
+				console.log(chalk.dim(`  Config saved to ~/.prime/runtimes/${name}.json`));
+			}
+		} else {
+			console.error(chalk.red(`✗ ${setupResult.message}`));
+			process.exitCode = 1;
 		}
 		return;
 	}
