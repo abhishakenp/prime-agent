@@ -1,27 +1,12 @@
 /**
  * Interactive TUI component for managing the fleet.
  *
- * Features:
- * - Auto-discovers on open (fast first, background probe second)
- * - Search/filter with fuzzy matching
- * - Grouped display: FLEET → ONLINE → OFFLINE with colored headers
- * - Multi-select with checkboxes: Space toggles, Enter batch-adds/removes
- * - Enter on unchecked item opens host action menu
- * - Color-coded status: green=online, red=offline, accent=fleet, dim=muted
- * - Aligned columns: checkbox | hostname | os | tags | status badges
+ * Uses the same MenuPanel infrastructure as the model picker —
+ * surface backgrounds, selection highlighting, scroll indicators,
+ * responsive layout.
  */
 
-import {
-	Container,
-	type Focusable,
-	fuzzyFilter,
-	getKeybindings,
-	Input,
-	Spacer,
-	Text,
-	truncateToWidth,
-	visibleWidth,
-} from "@earendil-works/pi-tui";
+import { Container, type Focusable, fuzzyFilter, getKeybindings, Spacer, Text } from "@earendil-works/pi-tui";
 import { bootstrapHost, checkHostStatus, disconnectHost } from "../../../cli/fleet/bootstrap.js";
 import { type DiscoveredDevice, discoverStream, inferTags } from "../../../cli/fleet/discovery.js";
 import {
@@ -34,7 +19,8 @@ import {
 	updateFleetHostStatus,
 } from "../../../cli/fleet/fleet-config.js";
 import { theme } from "../theme/theme.js";
-import { DynamicBorder } from "./dynamic-border.js";
+import { getMenuListLayout, MenuList, MenuPanel, MenuRow, MenuSearchInput } from "./menu-panel.js";
+import { shouldTreatAsBack } from "./modal-back.js";
 
 type FleetView = "main" | "host-actions";
 
@@ -53,14 +39,20 @@ interface FleetEntry {
 	device?: DiscoveredDevice;
 }
 
+const PREFERRED_VISIBLE = 10;
+const RESERVED_ROWS = 7;
+
+/**
+ * Fleet selector — same visual language as ModelSelectorComponent.
+ */
 export class FleetSelectorComponent extends Container implements Focusable {
 	focused = false;
-	private searchInput: Input;
+	private searchInput: MenuSearchInput;
 	private currentView: FleetView = "main";
 	private entries: FleetEntry[] = [];
 	private filteredEntries: FleetEntry[] = [];
 	private selectedEntry: FleetEntry | null = null;
-	private cursorIndex = 0;
+	private selectedIndex = 0;
 	private checkedSet = new Set<string>();
 	private statusText = "";
 	private isLoading = false;
@@ -71,26 +63,50 @@ export class FleetSelectorComponent extends Container implements Focusable {
 	private readonly onDone: () => void;
 	private readonly requestRender: () => void;
 
+	private panel: MenuPanel;
+	private listContainer: MenuList;
+	private headerContainer: Container;
+	private listLayout = getMenuListLayout({
+		preferredVisibleItems: PREFERRED_VISIBLE,
+		reservedRows: RESERVED_ROWS,
+		comfortableItemRows: 3,
+		compactItemRows: 2,
+	});
+	private responsiveLayoutKey = "";
+
 	constructor(onDone: () => void, _onCancel: () => void, requestRender: () => void) {
 		super();
 		this.onDone = onDone;
 		this.requestRender = requestRender;
-		this.searchInput = new Input();
+
 		this.isLoading = true;
 		this.statusText = "Discovering networked devices...";
 
-		this.addChild(new DynamicBorder());
-		this.addChild(new Text(theme.bold(theme.fg("accent", " Fleet Manager")), 1, 0));
-		this.addChild(new Spacer(1));
-		this.addChild(this.searchInput);
-		this.addChild(new Spacer(1));
-		this.addChild(new Text(theme.fg("dim", this.statusText), 1, 0));
-		this.addChild(new DynamicBorder());
+		this.panel = new MenuPanel({
+			title: "Fleet",
+			subtitle: "Networked devices across all reachable networks.",
+		});
+		this.addChild(this.panel);
 
+		this.headerContainer = new Container();
+		this.panel.addChild(this.headerContainer);
+
+		this.searchInput = new MenuSearchInput("Search devices");
+		this.searchInput.onSubmit = () => {
+			this.handleConfirm();
+		};
+		this.panel.addChild(this.searchInput);
+		this.panel.addChild(new Spacer(1));
+
+		this.listContainer = new MenuList({ compact: () => this.listLayout.compact });
+		this.panel.addChild(this.listContainer);
+
+		this.updateHeader();
+		this.updateList();
 		void this.autoDiscover();
 	}
 
-	getSearchInput(): Input {
+	getSearchInput(): MenuSearchInput {
 		return this.searchInput;
 	}
 
@@ -99,14 +115,11 @@ export class FleetSelectorComponent extends Container implements Focusable {
 	private async autoDiscover(): Promise<void> {
 		this.setLoading("Discovering networked devices...");
 
-		// Load fleet hosts first — they appear instantly
 		const fleetHosts = await listFleetHosts();
 		this.clearLoading();
 		this.entries = mergeHostsAndDevices(fleetHosts, []);
 		this.applyFilter();
 
-		// Stream devices as they're discovered — no phases, no batches
-		// Each device appears in the TUI the moment it's found
 		try {
 			for await (const device of discoverStream({ probeTimeoutMs: 2000 })) {
 				this.mergeDevice(device);
@@ -118,9 +131,11 @@ export class FleetSelectorComponent extends Container implements Focusable {
 			// Discovery interrupted — keep what we have
 		}
 
-		this.statusText = `Discovery complete · ${this.entries.length} devices`;
+		this.statusText = `${this.entries.length} devices found`;
 		if (this.currentView === "main") {
-			this.applyFilter();
+			this.updateHeader();
+			this.updateList();
+			this.requestRender();
 		}
 	}
 
@@ -130,7 +145,6 @@ export class FleetSelectorComponent extends Container implements Focusable {
 		);
 
 		if (existing) {
-			// Enrich existing entry with new info
 			existing.online = device.online || existing.online;
 			existing.sshable = device.sshable ?? existing.sshable;
 			existing.hasPi = device.hasPi ?? existing.hasPi;
@@ -170,137 +184,125 @@ export class FleetSelectorComponent extends Container implements Focusable {
 			if (a.online !== b.online) return a.online ? -1 : 1;
 			return a.hostname.localeCompare(b.hostname);
 		});
-		if (this.cursorIndex >= this.filteredEntries.length) {
-			this.cursorIndex = Math.max(0, this.filteredEntries.length - 1);
+		if (this.selectedIndex >= this.filteredEntries.length) {
+			this.selectedIndex = Math.max(0, this.filteredEntries.length - 1);
 		}
-		this.rebuildChildren();
+		this.updateHeader();
+		this.updateList();
+		this.requestRender();
 	}
 
 	// ─── Rendering ────────────────────────────────────────────────────
 
-	private rebuildChildren(): void {
-		this.children = [];
-		this.addChild(new DynamicBorder());
-		this.addChild(new Text(theme.bold(theme.fg("accent", " Fleet Manager")), 1, 0));
-		this.addChild(new Spacer(1));
+	private updateHeader(): void {
+		this.headerContainer.clear();
+		if (this.statusText) {
+			this.headerContainer.addChild(new Text(theme.fg("muted", this.statusText), 0, 0));
+			this.headerContainer.addChild(new Spacer(1));
+		}
+	}
 
-		// Search bar
-		this.addChild(this.searchInput);
-		this.addChild(new Spacer(1));
+	override render(width: number): string[] {
+		const prevKey = this.responsiveLayoutKey;
+		this.updateResponsiveLayout();
+		if (this.responsiveLayoutKey !== prevKey) {
+			this.updateList();
+		}
+		return super.render(width);
+	}
 
-		// Device list with group headers
-		if (this.isLoading) {
-			this.addChild(new Text(theme.fg("dim", `  ${this.statusText}`), 1, 0));
-		} else if (this.filteredEntries.length === 0) {
-			this.addChild(new Text(theme.fg("dim", "  No devices found"), 1, 0));
-		} else if (this.currentView === "main") {
-			this.renderGroupedList();
-		} else {
+	private updateResponsiveLayout(): void {
+		this.listLayout = getMenuListLayout({
+			preferredVisibleItems: PREFERRED_VISIBLE,
+			reservedRows: RESERVED_ROWS,
+			comfortableItemRows: 3,
+			compactItemRows: 2,
+			totalItems: this.filteredEntries.length,
+		});
+		this.responsiveLayoutKey = `${this.listLayout.compact}:${this.listLayout.visibleItems}`;
+	}
+
+	private updateList(): void {
+		this.updateResponsiveLayout();
+		this.listContainer.clear();
+
+		if (this.currentView === "host-actions") {
 			this.renderHostActions();
+			return;
 		}
 
-		this.addChild(new Spacer(1));
-		this.addChild(new Text(this.getStatusLine(), 1, 0));
-		this.addChild(new DynamicBorder());
-		this.requestRender();
-	}
-
-	private renderGroupedList(): void {
-		const fleetItems = this.filteredEntries.filter((e) => e.inFleet);
-		const onlineItems = this.filteredEntries.filter((e) => !e.inFleet && e.online);
-		const offlineItems = this.filteredEntries.filter((e) => !e.inFleet && !e.online);
-
-		let virtualIndex = 0;
-
-		if (fleetItems.length > 0) {
-			this.addChild(new Text(theme.fg("accent", theme.bold(` FLEET (${fleetItems.length})`)), 1, 0));
-			for (const entry of fleetItems) {
-				this.addDeviceRow(entry, virtualIndex);
-				virtualIndex++;
-			}
-			this.addChild(new Spacer(1));
+		if (this.isLoading) {
+			this.listContainer.addChild(new Text(theme.fg("muted", this.statusText), 0, 0));
+			return;
 		}
 
-		if (onlineItems.length > 0) {
-			this.addChild(new Text(theme.fg("success", theme.bold(` ONLINE (${onlineItems.length})`)), 1, 0));
-			for (const entry of onlineItems) {
-				this.addDeviceRow(entry, virtualIndex);
-				virtualIndex++;
-			}
+		if (this.filteredEntries.length === 0) {
+			this.listContainer.addChild(new Text(theme.fg("muted", "No devices found"), 0, 0));
+			return;
 		}
 
-		if (offlineItems.length > 0) {
-			if (onlineItems.length > 0 || fleetItems.length > 0) {
-				this.addChild(new Spacer(1));
-			}
-			this.addChild(new Text(theme.fg("dim", theme.bold(` OFFLINE (${offlineItems.length})`)), 1, 0));
-			for (const entry of offlineItems) {
-				this.addDeviceRow(entry, virtualIndex);
-				virtualIndex++;
-			}
+		const maxVisible = this.listLayout.visibleItems;
+		const start = Math.max(
+			0,
+			Math.min(this.selectedIndex - Math.floor(maxVisible / 2), this.filteredEntries.length - maxVisible),
+		);
+		const end = Math.min(start + maxVisible, this.filteredEntries.length);
+
+		for (let i = start; i < end; i++) {
+			const entry = this.filteredEntries[i];
+			if (!entry) continue;
+			const isSelected = i === this.selectedIndex;
+			this.listContainer.addChild(this.makeDeviceRow(entry, isSelected));
+		}
+
+		// Scroll indicator
+		if (start > 0 || end < this.filteredEntries.length) {
+			this.listContainer.addChild(
+				new Text(theme.fg("muted", `  (${this.selectedIndex + 1}/${this.filteredEntries.length})`), 0, 0),
+			);
 		}
 	}
 
-	private addDeviceRow(entry: FleetEntry, virtualIndex: number): void {
-		const isSelected = virtualIndex === this.cursorIndex;
-		const isChecked = this.checkedSet.has(entry.hostname);
-
-		// Checkbox
-		const checkbox = isChecked ? theme.fg("success", "[✓]") : theme.fg("dim", "[ ]");
-
-		// Display name — use displayName if set, otherwise hostname
+	private makeDeviceRow(entry: FleetEntry, selected: boolean): MenuRow {
 		const displayName = entry.fleetHost?.displayName ?? entry.hostname;
-		const hostnameColor = entry.inFleet ? "accent" : entry.online ? "text" : "dim";
-		const hostname = theme.fg(hostnameColor, truncateToWidth(displayName, 22, ""));
+		const isChecked = this.checkedSet.has(entry.hostname);
+		const check = isChecked ? "✓ " : "";
+		const primary = `${check}${displayName}`;
 
-		// OS badge
-		const osBadge = entry.os ? this.formatOsBadge(entry.os) : "";
+		// Secondary line: address + os
+		const osLabel = entry.os ? this.formatOs(entry.os) : "?";
+		const secondary = `${entry.address} · ${osLabel}`;
 
-		// Status badges
-		const badges = this.formatBadges(entry);
+		// Meta: status badges
+		const meta = this.formatMeta(entry);
 
-		// Cursor prefix
-		const prefix = isSelected ? theme.fg("accent", "›") : " ";
-
-		const padding = " ".repeat(Math.max(1, 24 - visibleWidth(displayName)));
-		const row = `${prefix} ${checkbox} ${hostname}${padding}${osBadge} ${badges}`;
-		this.addChild(new Text(row, 1, 0));
+		return new MenuRow({ primary, secondary, meta, selected });
 	}
 
-	private formatOsBadge(os: string): string {
-		const osLower = os.toLowerCase();
-		if (osLower.includes("mac") || osLower.includes("darwin")) {
-			return theme.fg("warning", "macOS".padEnd(7));
-		}
-		if (osLower.includes("linux")) {
-			return theme.fg("success", "Linux ".padEnd(7));
-		}
-		if (osLower.includes("android")) {
-			return theme.fg("muted", "Andrd ".padEnd(7));
-		}
-		return theme.fg("dim", "?     ".padEnd(7));
+	private formatOs(os: string): string {
+		const l = os.toLowerCase();
+		if (l.includes("mac") || l.includes("darwin")) return "macOS";
+		if (l.includes("linux")) return "Linux";
+		if (l.includes("android")) return "Android";
+		if (l.includes("windows")) return "Windows";
+		return os;
 	}
 
-	private formatBadges(entry: FleetEntry): string {
+	private formatMeta(entry: FleetEntry): string {
 		const parts: string[] = [];
-		if (entry.sshable) parts.push(theme.fg("success", "ssh"));
-		if (entry.hasPi) parts.push(theme.fg("success", "pi"));
-		if (entry.inFleet) parts.push(theme.fg("accent", "●fleet"));
-		if (!entry.online && !entry.inFleet) parts.push(theme.fg("error", "offline"));
-		if (entry.tags.length > 0 && !entry.inFleet) {
-			parts.push(theme.fg("dim", entry.tags.slice(0, 2).join(",")));
-		}
-		return parts.length > 0 ? parts.join(" ") : "";
+		if (entry.inFleet) parts.push("fleet");
+		else if (entry.online) parts.push("online");
+		else parts.push("offline");
+		if (entry.sshable) parts.push("ssh");
+		if (entry.hasPi) parts.push("pi");
+		return parts.join(" · ");
 	}
 
 	private renderHostActions(): void {
 		const entry = this.selectedEntry;
 		if (!entry) return;
 
-		this.addChild(new Text(theme.fg("accent", ` ${entry.hostname}`), 1, 0));
-		this.addChild(new Text(theme.fg("dim", ` ${entry.address} · ${entry.os ?? "?"}`), 1, 0));
-		this.addChild(new Spacer(1));
-
+		const displayName = entry.fleetHost?.displayName ?? entry.hostname;
 		const actions: { key: string; label: string; desc: string }[] = [
 			{ key: "s", label: "Check status", desc: "Probe SSH, pi, daemon" },
 			{
@@ -320,25 +322,29 @@ export class FleetSelectorComponent extends Container implements Focusable {
 			actions.push({ key: "a", label: "Add to fleet", desc: `Tags: ${entry.tags.join(", ")}` });
 		}
 
+		// Header row for the device
+		this.listContainer.addChild(
+			new MenuRow({
+				primary: displayName,
+				secondary: `${entry.address} · ${entry.os ?? "?"}`,
+				meta: this.formatMeta(entry),
+				selected: false,
+			}),
+		);
+		this.listContainer.addChild(new Spacer(1));
+
 		for (const action of actions) {
-			this.addChild(
-				new Text(`  ${theme.fg("accent", action.key)}  ${action.label}  ${theme.fg("dim", action.desc)}`, 1, 0),
+			this.listContainer.addChild(
+				new MenuRow({
+					primary: `${action.key}  ${action.label}`,
+					secondary: action.desc,
+					selected: false,
+				}),
 			);
 		}
-		this.addChild(new Spacer(1));
-		this.addChild(new Text(theme.fg("dim", "  Press key to execute · esc to go back"), 1, 0));
-	}
 
-	private getStatusLine(): string {
-		if (this.currentView === "host-actions") {
-			return theme.fg("dim", "  Action mode · esc to go back");
-		}
-		const total = this.entries.length;
-		const online = this.entries.filter((e) => e.online).length;
-		const fleet = this.entries.filter((e) => e.inFleet).length;
-		const checked = this.checkedSet.size;
-		const checkInfo = checked > 0 ? theme.fg("accent", ` ${checked} selected`) : "";
-		return `${theme.fg("dim", `  ${total} devices · ${online} online · ${fleet} in fleet`)}${checkInfo}  ${theme.fg("dim", "Space select · Enter add/remove · / search · q quit")}`;
+		this.listContainer.addChild(new Spacer(1));
+		this.listContainer.addChild(new Text(theme.fg("muted", "  Press key to execute · esc to go back"), 0, 0));
 	}
 
 	// ─── Keyboard ─────────────────────────────────────────────────────
@@ -362,11 +368,12 @@ export class FleetSelectorComponent extends Container implements Focusable {
 				this._tagging = false;
 				this.searchInput.setValue("");
 				this.statusText = "";
-				this.rebuildChildren();
+				this.updateHeader();
+				this.updateList();
 				return;
 			}
 			this.searchInput.handleInput(data);
-			this.rebuildChildren();
+			this.requestRender();
 			return;
 		}
 
@@ -388,7 +395,7 @@ export class FleetSelectorComponent extends Container implements Focusable {
 		}
 
 		// Escape: if search has text, clear it; otherwise quit
-		if (kb.matches(data, "tui.select.cancel")) {
+		if (kb.matches(data, "tui.select.cancel") || shouldTreatAsBack(data, this.searchInput)) {
 			if (this.searchInput.getValue() !== "") {
 				this.searchInput.setValue("");
 				this.applyFilter();
@@ -398,28 +405,35 @@ export class FleetSelectorComponent extends Container implements Focusable {
 			return;
 		}
 
-		// Navigation keys (when not typing search)
+		// Navigation
 		if (kb.matches(data, "tui.select.up")) {
-			this.cursorIndex = this.cursorIndex === 0 ? this.filteredEntries.length - 1 : this.cursorIndex - 1;
-			this.rebuildChildren();
+			const count = this.filteredEntries.length;
+			if (count === 0) return;
+			this.selectedIndex = this.selectedIndex === 0 ? count - 1 : this.selectedIndex - 1;
+			this.updateList();
+			this.requestRender();
 			return;
 		}
 		if (kb.matches(data, "tui.select.down")) {
-			this.cursorIndex = this.cursorIndex === this.filteredEntries.length - 1 ? 0 : this.cursorIndex + 1;
-			this.rebuildChildren();
+			const count = this.filteredEntries.length;
+			if (count === 0) return;
+			this.selectedIndex = this.selectedIndex === count - 1 ? 0 : this.selectedIndex + 1;
+			this.updateList();
+			this.requestRender();
 			return;
 		}
 
 		// Space: toggle checkbox
 		if (data === " ") {
-			const entry = this.filteredEntries[this.cursorIndex];
+			const entry = this.filteredEntries[this.selectedIndex];
 			if (entry) {
 				if (this.checkedSet.has(entry.hostname)) {
 					this.checkedSet.delete(entry.hostname);
 				} else {
 					this.checkedSet.add(entry.hostname);
 				}
-				this.rebuildChildren();
+				this.updateList();
+				this.requestRender();
 			}
 			return;
 		}
@@ -440,13 +454,17 @@ export class FleetSelectorComponent extends Container implements Focusable {
 			await this.batchAddRemove();
 			return;
 		}
-		// No items checked — open host actions
-		const entry = this.filteredEntries[this.cursorIndex];
+		const entry = this.filteredEntries[this.selectedIndex];
 		if (entry) {
 			this.currentView = "host-actions";
 			this.selectedEntry = entry;
-			this.rebuildChildren();
+			this.updateList();
+			this.requestRender();
 		}
+	}
+
+	private handleConfirm(): void {
+		void this.handleEnter();
 	}
 
 	private handleHostActionsInput(data: string): void {
@@ -454,7 +472,8 @@ export class FleetSelectorComponent extends Container implements Focusable {
 		if (kb.matches(data, "tui.select.cancel")) {
 			this.currentView = "main";
 			this.selectedEntry = null;
-			this.rebuildChildren();
+			this.updateList();
+			this.requestRender();
 			return;
 		}
 		const entry = this.selectedEntry;
@@ -581,7 +600,9 @@ export class FleetSelectorComponent extends Container implements Focusable {
 						: "unreachable";
 					await updateFleetHostStatus(entry.hostname, entry.fleetHost.lastStatus);
 				}
-				this.rebuildChildren();
+				this.updateHeader();
+				this.updateList();
+				this.requestRender();
 				break;
 			}
 			case "bootstrap": {
@@ -626,7 +647,8 @@ export class FleetSelectorComponent extends Container implements Focusable {
 				}
 				this.currentView = "main";
 				this.selectedEntry = null;
-				this.rebuildChildren();
+				this.updateList();
+				this.requestRender();
 				break;
 			}
 			case "disconnect": {
@@ -637,7 +659,8 @@ export class FleetSelectorComponent extends Container implements Focusable {
 				this.statusText = `✓ ${entry.hostname} disconnected`;
 				this.currentView = "main";
 				this.selectedEntry = null;
-				this.rebuildChildren();
+				this.updateList();
+				this.requestRender();
 				break;
 			}
 			case "remove": {
@@ -670,12 +693,15 @@ export class FleetSelectorComponent extends Container implements Focusable {
 			case "rename": {
 				if (!entry.inFleet) {
 					this.statusText = `Add ${entry.hostname} to fleet first to rename`;
-					this.rebuildChildren();
+					this.updateHeader();
+					this.updateList();
+					this.requestRender();
 					break;
 				}
 				this.searchInput.setValue("");
 				this.statusText = `Enter new name for ${entry.hostname} (Enter to confirm, Esc to cancel):`;
-				this.rebuildChildren();
+				this.updateHeader();
+				this.updateList();
 				this._renameTarget = entry.hostname;
 				this._renaming = true;
 				break;
@@ -683,12 +709,15 @@ export class FleetSelectorComponent extends Container implements Focusable {
 			case "tag": {
 				if (!entry.inFleet) {
 					this.statusText = `Add ${entry.hostname} to fleet first to tag`;
-					this.rebuildChildren();
+					this.updateHeader();
+					this.updateList();
+					this.requestRender();
 					break;
 				}
 				this.searchInput.setValue("");
 				this.statusText = `Enter tag for ${entry.hostname} (Enter to add, Esc to cancel):`;
-				this.rebuildChildren();
+				this.updateHeader();
+				this.updateList();
 				this._tagTarget = entry.hostname;
 				this._tagging = true;
 				break;
@@ -696,12 +725,16 @@ export class FleetSelectorComponent extends Container implements Focusable {
 			case "ssh": {
 				const target = entry.address;
 				this.statusText = `SSH to ${target}...`;
-				this.rebuildChildren();
+				this.updateHeader();
+				this.updateList();
+				this.requestRender();
 				const { spawn } = await import("node:child_process");
 				const ssh = spawn("ssh", [target], { stdio: "inherit" });
 				ssh.on("exit", () => {
 					this.statusText = `SSH session ended`;
-					this.rebuildChildren();
+					this.updateHeader();
+					this.updateList();
+					this.requestRender();
 				});
 				break;
 			}
@@ -713,7 +746,9 @@ export class FleetSelectorComponent extends Container implements Focusable {
 	private setLoading(text: string): void {
 		this.isLoading = true;
 		this.statusText = text;
-		this.rebuildChildren();
+		this.updateHeader();
+		this.updateList();
+		this.requestRender();
 	}
 
 	private clearLoading(): void {
