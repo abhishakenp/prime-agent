@@ -53,10 +53,15 @@ export function userRuntimesDir(): string {
 
 /** Built-in plugin directory: <installDir>/dist/plugins/runtimes/ */
 export function builtinRuntimesDir(): string {
-	// This file is at: <installDir>/dist/core/fleet-runtime/runtime-plugin-loader.js
-	// Built-in plugins are at: <installDir>/dist/plugins/runtimes/
 	try {
 		const thisFile = fileURLToPath(import.meta.url);
+		const dir = dirname(thisFile);
+		// Bundled:   <pkgDir>/dist/bundle/cli.js → dir = dist/bundle → 3 levels up
+		if (dir.endsWith("bundle")) {
+			const pkgDir = dirname(dirname(dirname(thisFile)));
+			return join(pkgDir, "dist", "plugins", "runtimes");
+		}
+		// Unbundled: <pkgDir>/dist/core/fleet-runtime/runtime-plugin-loader.js → 4 levels up
 		const installDir = dirname(dirname(dirname(dirname(thisFile))));
 		return join(installDir, "dist", "plugins", "runtimes");
 	} catch {

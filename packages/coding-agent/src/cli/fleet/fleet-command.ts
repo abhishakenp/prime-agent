@@ -36,6 +36,13 @@ import {
 	tagHostInFleet,
 	untagHostInFleet,
 } from "./fleet-operations.js";
+import {
+	configureRuntimePlugin,
+	installRuntimePlugin,
+	listRuntimePlugins,
+	toggleRuntimePlugin,
+	uninstallRuntimePlugin,
+} from "./runtime-operations.js";
 
 type FleetSubcommand =
 	| "list"
@@ -51,6 +58,7 @@ type FleetSubcommand =
 	| "ssh"
 	| "status"
 	| "bootstrap"
+	| "runtimes"
 	| undefined;
 
 export async function handleFleetCommand(args: string[]): Promise<void> {
@@ -97,6 +105,9 @@ export async function handleFleetCommand(args: string[]): Promise<void> {
 			break;
 		case "bootstrap":
 			await bootstrapHostCmd(rest);
+			break;
+		case "runtimes":
+			await runtimesCmd(rest);
 			break;
 		default:
 			console.error(chalk.red(`Unknown fleet command: ${subcommand}`));
@@ -419,4 +430,121 @@ async function bootstrapHostCmd(args: string[]): Promise<void> {
 async function interactiveFleetTUI(): Promise<void> {
 	const { selectFleetInteractive } = await import("../fleet-selector.js");
 	await selectFleetInteractive();
+}
+
+// ─── runtimes ──────────────────────────────────────────────────────
+
+async function runtimesCmd(args: string[]): Promise<void> {
+	const action = args[0];
+	const json = args.includes("--json");
+
+	if (action === "list" || !action) {
+		const plugins = await listRuntimePlugins();
+		if (json) {
+			console.log(JSON.stringify({ plugins }, null, 2));
+			return;
+		}
+		console.log(chalk.bold("\n  Runtime Plugins\n"));
+		console.log(
+			`  ${"NAME".padEnd(18)} ${"SOURCE".padEnd(10)} ${"STATUS".padEnd(10)} ${"CONFIG".padEnd(8)} ${"SIZE"}`,
+		);
+		console.log(`  ${"─".repeat(18)} ${"─".repeat(10)} ${"─".repeat(10)} ${"─".repeat(8)} ${"─".repeat(10)}`);
+		for (const p of plugins) {
+			const status = p.active
+				? chalk.green("● active")
+				: p.source === "template"
+					? chalk.dim("○ available")
+					: chalk.yellow("○ disabled");
+			const config = p.hasConfig ? chalk.green("✓") : "-";
+			const size = `${(p.size / 1024).toFixed(0)}KB`;
+			const name =
+				p.source === "builtin" ? chalk.cyan(p.name) : p.source === "user" ? chalk.green(p.name) : chalk.dim(p.name);
+			console.log(`  ${name.padEnd(18)} ${p.source.padEnd(10)} ${status.padEnd(10)} ${config.padEnd(8)} ${size}`);
+		}
+		console.log(chalk.dim(`\n  Install: prime-agent fleet runtimes install <name>`));
+		console.log(chalk.dim(`  Enable:  prime-agent fleet runtimes enable <name>`));
+		console.log(chalk.dim(`  Disable: prime-agent fleet runtimes disable <name>`));
+		console.log(chalk.dim(`  Config:  prime-agent fleet runtimes config <name> <key> <value>\n`));
+		return;
+	}
+
+	if (action === "install") {
+		const name = args[1];
+		if (!name) {
+			console.error(chalk.red("Usage: prime-agent fleet runtimes install <name>"));
+			process.exitCode = 1;
+			return;
+		}
+		const result = installRuntimePlugin(name);
+		if (result.success) console.log(chalk.green(`✓ ${result.message}`));
+		else console.error(chalk.red(result.message));
+		process.exitCode = result.success ? 0 : 1;
+		return;
+	}
+
+	if (action === "uninstall") {
+		const name = args[1];
+		if (!name) {
+			console.error(chalk.red("Usage: prime-agent fleet runtimes uninstall <name>"));
+			process.exitCode = 1;
+			return;
+		}
+		const result = uninstallRuntimePlugin(name);
+		if (result.success) console.log(chalk.green(`✓ ${result.message}`));
+		else console.error(chalk.red(result.message));
+		process.exitCode = result.success ? 0 : 1;
+		return;
+	}
+
+	if (action === "enable") {
+		const name = args[1];
+		if (!name) {
+			console.error(chalk.red("Usage: prime-agent fleet runtimes enable <name>"));
+			process.exitCode = 1;
+			return;
+		}
+		const result = toggleRuntimePlugin(name, true);
+		if (result.success) console.log(chalk.green(`✓ ${result.message}`));
+		else console.error(chalk.red(result.message));
+		process.exitCode = result.success ? 0 : 1;
+		return;
+	}
+
+	if (action === "disable") {
+		const name = args[1];
+		if (!name) {
+			console.error(chalk.red("Usage: prime-agent fleet runtimes disable <name>"));
+			process.exitCode = 1;
+			return;
+		}
+		const result = toggleRuntimePlugin(name, false);
+		if (result.success) console.log(chalk.green(`✓ ${result.message}`));
+		else console.error(chalk.red(result.message));
+		process.exitCode = result.success ? 0 : 1;
+		return;
+	}
+
+	if (action === "config") {
+		const [name, key, ...valueParts] = args.slice(1);
+		const value = valueParts.join(" ");
+		if (!name || !key || !value) {
+			console.error(chalk.red("Usage: prime-agent fleet runtimes config <name> <key> <value>"));
+			process.exitCode = 1;
+			return;
+		}
+		// Try to parse value as JSON, fall back to string
+		let parsed: unknown = value;
+		try {
+			parsed = JSON.parse(value);
+		} catch {}
+		const result = configureRuntimePlugin(name, { [key]: parsed });
+		if (result.success) console.log(chalk.green(`✓ ${result.message}`));
+		else console.error(chalk.red(result.message));
+		process.exitCode = result.success ? 0 : 1;
+		return;
+	}
+
+	console.error(chalk.red(`Unknown runtimes subcommand: ${action}`));
+	console.error(chalk.dim("Available: list, install, uninstall, enable, disable, config"));
+	process.exitCode = 1;
 }
