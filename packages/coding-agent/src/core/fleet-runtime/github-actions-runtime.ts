@@ -551,14 +551,16 @@ export async function setupGitHubActions(
 		}
 	}
 
-	// 4. Offer: create new private repo, or use existing
+	// 4. Offer: create new repo (public or private), or use existing
 	const choice = await prompt.choose("GitHub Actions needs a dedicated repo for agent runs. What do you want to do?", [
-		"Create a new private repo (recommended)",
+		"Create a new public repo (unlimited Actions compute)",
+		"Create a new private repo (limited but hidden)",
 		"Use an existing repo (enter name)",
 	]);
 
-	if (choice === 0) {
-		// Create new private repo
+	if (choice === 0 || choice === 1) {
+		// Create new repo
+		const isPublic = choice === 0;
 		const defaultName = "prime-agent-runs";
 		const repoName = await prompt.ask("Repo name:", defaultName);
 		if (!repoName) {
@@ -574,10 +576,11 @@ export async function setupGitHubActions(
 		}
 
 		const fullRepo = `${username}/${repoName}`;
-		prompt.status(`Creating private repo ${fullRepo}...`);
+		const visibilityFlag = isPublic ? "--public" : "--private";
+		prompt.status(`Creating ${isPublic ? "public" : "private"} repo ${fullRepo}...`);
 
 		try {
-			execSync(`gh repo create ${repoName} --private --description "Prime Agent runtime runs"`, {
+			execSync(`gh repo create ${repoName} ${visibilityFlag} --description "Prime Agent runtime runs"`, {
 				encoding: "utf-8",
 				stdio: ["pipe", "pipe", "pipe"],
 			});
@@ -596,10 +599,10 @@ export async function setupGitHubActions(
 		newConfig.token = token;
 		return {
 			success: true,
-			message: `Created private repo ${fullRepo} for GitHub Actions runs`,
+			message: `Created ${isPublic ? "public" : "private"} repo ${fullRepo} for GitHub Actions runs`,
 			config: newConfig,
 		};
-	} else if (choice === 1) {
+	} else if (choice === 2) {
 		// Use existing repo
 		const repoInput = await prompt.ask("Enter repo (owner/name):");
 		if (!repoInput) {
