@@ -1,26 +1,22 @@
 /**
- * SSH runtime adapter — spawns agents on fleet hosts via SSH.
+ * SSH runtime adapter — deploys self-contained agent bundles to fleet hosts.
  *
  * Flow:
- * 1. Orchestrator calls spawn() with target host
- * 2. SSHRuntime connects to the host and runs:
- *      prime-agent --headless --session <id> --prompt "..." --work-dir ~/...
- * 3. The agent runs on the remote host with its own IPython kernel
- * 4. Status is polled via SSH (checking process / reading session JSONL)
- * 5. If the host is gateway-connected, events stream via WebSocket instead
- * 6. Files are transferred via SSH (scp/cat)
- * 7. The remote agent can itself spawn sub-agents on other fleet hosts
+ * 1. Orchestrator calls spawn()
+ * 2. SSHRuntime assembles an AgentBundle (runtime + files + creds + config)
+ * 3. tars the bundle and pipes it over SSH
+ * 4. Target extracts and runs ./run.sh
+ * 5. The agent starts with everything it needs — no pre-install required
+ * 6. Events stream back over SSH stdout (JSONL)
+ * 7. Files can be requested/sent via SSH cat
  *
- * The spawned agent is fully self-contained:
- * - Its own working directory under ~/ on the target
- * - Its own session directory
- * - Its own IPython kernel
- * - Can request files from the orchestrator via gateway
- * - Can spawn recursively on other hosts
+ * The target host needs only: bash + node. Everything else is in the bundle.
+ * Like Needle: "one artifact runs anywhere."
  */
 
 import { spawn } from "node:child_process";
 import { getFleetHost } from "../../cli/fleet/fleet-config.js";
+import { type AgentIdentitySpec, assembleBundle, type BundleSpec, tarBundle } from "./agent-bundle.js";
 import type {
 	AgentEvent,
 	AgentIdentity,
@@ -36,8 +32,6 @@ export class SSHRuntime implements AgentRuntime {
 	readonly platform = "ssh";
 
 	canSpawn(host: string): boolean {
-		// SSH runtime handles any host that's not a known platform name
-		// and not "local"/"self"/"localhost"
 		const knownPlatforms = [
 			"local",
 			"self",
@@ -73,32 +67,45 @@ export class SSHRuntime implements AgentRuntime {
 			parentAgentId: request.parent?.agentId,
 		};
 
-		// Build the remote command
-		// The agent runs headless — no TUI, just the RLM loop
-		const escapedPrompt = request.prompt.replace(/'/g, "'\\''");
-		const workDirPath = sessionDir.startsWith("/") ? sessionDir : `~/${sessionDir}`;
-		const remoteCmd = [
-			`mkdir -p ${workDirPath}`,
-			"&&",
-			"prime-agent",
-			"--headless",
-			`--session-id ${agentId}`,
-			`--work-dir ${workDirPath}`,
-			`--prompt '${escapedPrompt}'`,
-			request.model ? `--model ${request.model}` : "",
-			request.name ? `--name '${request.name.replace(/'/g, "'\\''")}'` : "",
-			`--depth ${request.depth}`,
-			request.parent ? `--parent-agent-id ${request.parent.agentId}` : "",
-			`--parent-host ${request.parent?.host ?? "local"}`,
-		]
-			.filter(Boolean)
-			.join(" ");
+		// Assemble the self-contained bundle
+		const identitySpec: AgentIdentitySpec = {
+			agentId,
+			host,
+			hardwareId: `${process.arch}-${process.platform}`,
+			depth: request.depth,
+			parentAgentId: request.parent?.agentId,
+			parentHost: request.parent?.host,
+		};
 
-		// Start the SSH session
+		const bundleSpec: BundleSpec = {
+			prompt: request.prompt,
+			identity: identitySpec,
+			model: request.model,
+			name: request.name,
+			workDir: request.workDir,
+			files: request.syncFiles,
+			includeCredentials: true,
+			cwd: process.cwd(),
+		};
+
+		const bundleDir = await assembleBundle(bundleSpec);
+		const tarPath = await tarBundle(bundleDir);
+
+		// Ship the bundle over SSH and run it
+		// The target receives the tarball, extracts it, and runs run.sh
+		const remoteBundleDir = `/tmp/prime-agent-bundle-${agentId.slice(0, 8)}`;
+		const remoteCmd = `mkdir -p ${remoteBundleDir} && tar xzf - -C ${remoteBundleDir} && bash ${remoteBundleDir}/$(ls ${remoteBundleDir})/run.sh`;
+
+		// Start SSH with the tarball piped to stdin
 		const ssh = spawn("ssh", [`${user}${target}`, remoteCmd], {
 			stdio: ["pipe", "pipe", "pipe"],
 			detached: false,
 		});
+
+		// Pipe the tarball to SSH stdin
+		const { createReadStream } = await import("node:fs");
+		const tarStream = createReadStream(tarPath);
+		tarStream.pipe(ssh.stdin);
 
 		// Track the process
 		let status: AgentStatus = "running";
@@ -106,7 +113,6 @@ export class SSHRuntime implements AgentRuntime {
 		const eventListeners = new Set<(event: AgentEvent) => void>();
 		const startTime = Date.now();
 
-		// Parse stdout for events (JSONL format)
 		ssh.stdout?.setEncoding("utf-8");
 		ssh.stdout?.on("data", (data: string) => {
 			for (const line of data.split("\n")) {
@@ -120,7 +126,6 @@ export class SSHRuntime implements AgentRuntime {
 						statusInfo = event.info;
 					}
 				} catch {
-					// Non-JSON output — emit as log
 					for (const listener of eventListeners) {
 						listener({ type: "log", level: "info", message: trimmed });
 					}
@@ -169,7 +174,7 @@ export class SSHRuntime implements AgentRuntime {
 			},
 			requestFile: async (path) => {
 				return new Promise((resolve, reject) => {
-					const scp = spawn("ssh", [`${user}${target}`, `cat ~/${sessionDir}/${path}`], {
+					const scp = spawn("ssh", [`${user}${target}`, `cat ${sessionDir}/${path}`], {
 						stdio: ["pipe", "pipe", "pipe"],
 					});
 					let output = "";
@@ -183,13 +188,12 @@ export class SSHRuntime implements AgentRuntime {
 			},
 			sendFile: async (path, content) => {
 				return new Promise((resolve, reject) => {
-					// Ensure directory exists, then write file
 					const escapedContent = content.replace(/'/g, "'\\''");
 					const scp = spawn(
 						"ssh",
 						[
 							`${user}${target}`,
-							`mkdir -p ~/${sessionDir}/$(dirname ${path}) && echo '${escapedContent}' > ~/${sessionDir}/${path}`,
+							`mkdir -p ${sessionDir}/$(dirname ${path}) && echo '${escapedContent}' > ${sessionDir}/${path}`,
 						],
 						{ stdio: ["pipe", "pipe", "pipe"] },
 					);
