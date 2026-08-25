@@ -1180,6 +1180,14 @@ export class AgentSession {
 	private _rlmChildUnsubscribes = new Map<string, () => void>();
 	/** Latest recap for this session, written by the daemon summarizer; read by a parent to label its child snapshots. */
 	private _currentRecap?: string;
+	/** Pending idle kernel shutdown timers for settled RLM children, keyed by childId. */
+	private _rlmChildKernelShutdownTimers = new Map<string, ReturnType<typeof setTimeout>>();
+	/** Default delay before shutting down an idle RLM child's kernel (ms). */
+	private static readonly _rlmChildKernelIdleMs = (() => {
+		const raw = process.env.PI_KERNEL_IDLE_MS;
+		if (raw && /^\d+$/.test(raw)) return Math.max(0, Number.parseInt(raw, 10));
+		return 5 * 60_000; // 5 minutes
+	})();
 
 	private _modelRegistry: ModelRegistry;
 
@@ -4016,6 +4024,11 @@ export class AgentSession {
 	}
 
 	private async _disposeAsyncOnce(): Promise<void> {
+		// Cancel all pending idle kernel shutdown timers
+		for (const timer of this._rlmChildKernelShutdownTimers.values()) {
+			clearTimeout(timer);
+		}
+		this._rlmChildKernelShutdownTimers.clear();
 		// Flush kernels/traces for both still-running and retained children; the sync
 		// dispose() below only tears them down synchronously.
 		for (const run of [...this._activeRlmChildRuns.values()]) {
@@ -9908,10 +9921,50 @@ export class AgentSession {
 		if (unsubscribe) {
 			this._rlmChildUnsubscribes.set(childId, unsubscribe);
 		}
+		// Schedule idle kernel shutdown for the settled child. The kernel can be
+		// lazily restarted by ensure() if the child is reactivated later.
+		this._scheduleRlmChildKernelShutdown(childId, session);
 		return true;
 	}
 
+	/**
+	 * Schedule a delayed kernel shutdown for a settled RLM child session.
+	 * The kernel process is killed after the idle timeout, freeing CPU and memory.
+	 * The session itself stays registered so the parent can still address it.
+	 * Cancelled automatically if the child is reactivated before the timer fires.
+	 */
+	private _scheduleRlmChildKernelShutdown(childId: string, session: AgentSession): void {
+		this._cancelRlmChildKernelShutdown(childId);
+		const delay = AgentSession._rlmChildKernelIdleMs;
+		if (delay <= 0) return; // disabled
+		const timer = setTimeout(() => {
+			this._rlmChildKernelShutdownTimers.delete(childId);
+			const child = this._rlmChildSessions.get(childId);
+			if (child !== session || this._disposed || this._disposing) return;
+			// Only shut down if the child is not actively working
+			if (child.isSessionActive) return;
+			const provisioner = child._ipythonKernelProvisioner;
+			if (!provisioner) return;
+			void provisioner.kill().catch(() => undefined);
+		}, delay);
+		timer.unref?.();
+		this._rlmChildKernelShutdownTimers.set(childId, timer);
+	}
+
+	/**
+	 * Cancel a pending idle kernel shutdown for an RLM child.
+	 * Called when a child is reactivated or explicitly released.
+	 */
+	private _cancelRlmChildKernelShutdown(childId: string): void {
+		const timer = this._rlmChildKernelShutdownTimers.get(childId);
+		if (timer) {
+			clearTimeout(timer);
+			this._rlmChildKernelShutdownTimers.delete(childId);
+		}
+	}
+
 	releaseRlmChildSession(childId: string, session: AgentSession): (() => void) | false {
+		this._cancelRlmChildKernelShutdown(childId);
 		const run = this._activeRlmChildRuns.get(childId);
 		if (run?.session === session && run.status === "done") {
 			const unsubscribe = run.unsubscribe ?? noopRlmChildEventUnsubscribe;
@@ -10267,6 +10320,8 @@ export class AgentSession {
 			if (run.status === "cancelled") throw new Error(run.error ?? "RLM child cancelled");
 		};
 		this._activeRlmChildRuns.set(run.id, run);
+		// Cancel any pending idle kernel shutdown for this childId (reactivation)
+		this._cancelRlmChildKernelShutdown(run.id);
 		this._unsettledRlmChildRuns.add(run);
 		const emitChildUpdate = () => {
 			const childModel = childSession?.model ?? modelSelection.model;
