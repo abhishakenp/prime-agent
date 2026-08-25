@@ -76,11 +76,14 @@ export class SSHRuntime implements AgentRuntime {
 		// Build the remote command
 		// The agent runs headless — no TUI, just the RLM loop
 		const escapedPrompt = request.prompt.replace(/'/g, "'\\''");
+		const workDirPath = sessionDir.startsWith("/") ? sessionDir : `~/${sessionDir}`;
 		const remoteCmd = [
+			`mkdir -p ${workDirPath}`,
+			"&&",
 			"prime-agent",
 			"--headless",
 			`--session-id ${agentId}`,
-			`--work-dir ~/${sessionDir}`,
+			`--work-dir ${workDirPath}`,
 			`--prompt '${escapedPrompt}'`,
 			request.model ? `--model ${request.model}` : "",
 			request.name ? `--name '${request.name.replace(/'/g, "'\\''")}'` : "",
