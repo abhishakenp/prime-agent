@@ -22,9 +22,15 @@ import { build } from "esbuild";
 const packageDir = dirname(dirname(fileURLToPath(import.meta.url)));
 const outDir = join(packageDir, "dist", "plugins", "runtimes");
 
-// Runtime entry points — each becomes a self-contained plugin
-const runtimes = [
+// Runtime entry points — only SSH is built-in.
+// CF, GH Actions, and all other runtimes are user-created plugins.
+// Templates for those are generated to dist/plugins/templates/ for users/agents
+// to copy into ~/.prime/runtimes/ when needed.
+const builtInRuntimes = [
 	{ name: "ssh", entry: "ssh-runtime.ts" },
+];
+
+const templateRuntimes = [
 	{ name: "cloudflare", entry: "cloudflare-runtime.ts" },
 	{ name: "github-actions", entry: "github-actions-runtime.ts" },
 ];
@@ -32,7 +38,8 @@ const runtimes = [
 rmSync(outDir, { recursive: true, force: true });
 mkdirSync(outDir, { recursive: true });
 
-for (const { name, entry } of runtimes) {
+// 1. Build built-in plugins (only SSH)
+for (const { name, entry } of builtInRuntimes) {
 	const entryPath = join(packageDir, "src", "core", "fleet-runtime", entry);
 	const outFile = join(outDir, `${name}.mjs`);
 
@@ -43,9 +50,7 @@ for (const { name, entry } of runtimes) {
 		format: "esm",
 		platform: "node",
 		target: "node22",
-		// Everything bundled — no external imports needed at runtime
 		external: [],
-		// Wrap in createRuntime export so the plugin loader can use it
 		footer: {
 			js: `
 // Plugin entry point — exported for the runtime plugin loader
@@ -57,10 +62,41 @@ export function createRuntime({ config }) {
 		logLevel: "warning",
 	});
 
-	console.log(`  bundled ${entry} -> dist/plugins/runtimes/${name}.mjs`);
+	console.log(`  built-in: ${entry} -> dist/plugins/runtimes/${name}.mjs`);
 }
 
-console.log(`Done: ${runtimes.length} runtime plugins built`);
+// 2. Build template plugins (CF, GH, etc.) — not loaded automatically.
+// Users or agents copy these to ~/.prime/runtimes/ to enable the platform.
+const templateDir = join(packageDir, "dist", "plugins", "templates");
+mkdirSync(templateDir, { recursive: true });
+
+for (const { name, entry } of templateRuntimes) {
+	const entryPath = join(packageDir, "src", "core", "fleet-runtime", entry);
+	const outFile = join(templateDir, `${name}.mjs`);
+
+	await build({
+		entryPoints: [entryPath],
+		outfile: outFile,
+		bundle: true,
+		format: "esm",
+		platform: "node",
+		target: "node22",
+		external: [],
+		footer: {
+			js: `
+// Plugin entry point — exported for the runtime plugin loader
+export function createRuntime({ config }) {
+  return new ${className(name)}(config);
+}
+`,
+		},
+		logLevel: "warning",
+	});
+
+	console.log(`  template: ${entry} -> dist/plugins/templates/${name}.mjs`);
+}
+
+console.log(`Done: ${builtInRuntimes.length} built-in + ${templateRuntimes.length} template plugins`);
 
 function className(name) {
 	// Explicit mapping — handles SSH (not Ssh), GitHubActions (not GithubActions)

@@ -11121,9 +11121,9 @@ export const MODELS = {
 			thinkingLevelMap: {"minimal":null,"low":null,"medium":null,"high":"high","xhigh":"max","max":null},
 			input: ["text"],
 			cost: {
-				input: 0.0798,
-				output: 0.1596,
-				cacheRead: 0.01596,
+				input: 0.077,
+				output: 0.154,
+				cacheRead: 0.015399999999999999,
 				cacheWrite: 0,
 			},
 			contextWindow: 1048576,
