@@ -25,7 +25,12 @@ import {
 	visibleWidth,
 } from "@earendil-works/pi-tui";
 import { type DiscoveredDevice, discoverStream, inferTags } from "../../../cli/fleet/discovery.js";
-import { type FleetHost, listFleetHosts } from "../../../cli/fleet/fleet-config.js";
+import {
+	type FleetHost,
+	importRuntimeMembers,
+	listFleetHosts,
+	listFleetMembers,
+} from "../../../cli/fleet/fleet-config.js";
 import {
 	addHostToFleet,
 	bootstrapFleetHost,
@@ -66,6 +71,14 @@ interface FleetEntry {
 	inFleet: boolean;
 	fleetHost?: FleetHost;
 	device?: DiscoveredDevice;
+	/** Transport type for unified fleet (ssh, cloudflare, github-actions, custom). */
+	transport?: string;
+	/** Transport-specific config. */
+	config?: Record<string, unknown>;
+	/** Whether this is a cloud member (not an SSH host). */
+	isCloud?: boolean;
+	/** Whether setup/config is complete. */
+	hasConfig?: boolean;
 }
 
 export interface FleetSelectorOptions {
@@ -91,6 +104,8 @@ export class FleetSelectorComponent extends Container implements Focusable {
 	private _renameTarget = "";
 	private _tagging = false;
 	private _tagTarget = "";
+	private _configuring = false;
+	private _configTarget = "";
 	private _runtimePlugins: RuntimePluginInfo[] = [];
 	private _runtimeCursor = 0;
 	private _selectedRuntime: RuntimePluginInfo | null = null;
@@ -129,11 +144,44 @@ export class FleetSelectorComponent extends Container implements Focusable {
 	// ─── Auto-discover — single streaming pipeline ───────────────────
 
 	private async autoDiscover(): Promise<void> {
-		this.setLoading("Discovering networked devices...");
+		this.setLoading("Discovering fleet members...");
 
+		// Import runtime configs as fleet members (idempotent)
+		await importRuntimeMembers();
+
+		// Load SSH hosts (legacy, still works)
 		const fleetHosts = await listFleetHosts();
 		this.clearLoading();
 		this.entries = mergeHostsAndDevices(fleetHosts, []);
+
+		// Load cloud members (cloudflare, github-actions, custom)
+		const members = await listFleetMembers();
+		for (const m of members) {
+			if (m.transport === "ssh") continue; // Already in fleetHosts
+			const existing = this.entries.find((e) => e.hostname === m.name);
+			if (existing) {
+				existing.transport = m.transport;
+				existing.config = m.config;
+				existing.isCloud = true;
+				existing.hasConfig = !!(m.config && Object.keys(m.config).length > 0);
+				existing.inFleet = true;
+			} else {
+				this.entries.push({
+					hostname: m.name,
+					address: (m.config?.repo as string) ?? (m.config?.accountId as string) ?? m.address ?? "-",
+					tags: m.tags,
+					source: "fleet",
+					online: m.enabled !== false,
+					sshable: false,
+					hasPi: false,
+					inFleet: true,
+					transport: m.transport,
+					config: m.config,
+					isCloud: true,
+					hasConfig: !!(m.config && Object.keys(m.config).length > 0),
+				});
+			}
+		}
 		this.applyFilter();
 
 		try {
@@ -147,7 +195,7 @@ export class FleetSelectorComponent extends Container implements Focusable {
 			// Discovery interrupted — keep what we have
 		}
 
-		this.statusText = `Discovery complete · ${this.entries.length} devices`;
+		this.statusText = `Discovery complete · ${this.entries.length} members`;
 		if (this.currentView === "main") {
 			this.applyFilter();
 		}
@@ -282,12 +330,16 @@ export class FleetSelectorComponent extends Container implements Focusable {
 		const displayName = entry.fleetHost?.displayName ?? entry.hostname;
 		const hostnameColor = entry.inFleet ? "accent" : entry.online ? "text" : "dim";
 		const hostname = theme.fg(hostnameColor, truncateToWidth(displayName, 22, ""));
-		const osBadge = entry.os ? this.formatOsBadge(entry.os) : "";
+		const transportBadge = entry.isCloud
+			? theme.fg("accent", (entry.transport ?? "cloud").padEnd(7))
+			: entry.os
+				? this.formatOsBadge(entry.os)
+				: "";
 		const badges = this.formatBadges(entry);
 		const prefix = isSelected ? theme.fg("accent", "›") : " ";
 
 		const padding = " ".repeat(Math.max(1, 27 - visibleWidth(displayName)));
-		const row = `${prefix} ${hostname}${padding}${osBadge} ${badges}`;
+		const row = `${prefix} ${hostname}${padding}${transportBadge} ${badges}`;
 		this.addChild(new Text(row, 1, 0));
 	}
 
@@ -323,32 +375,72 @@ export class FleetSelectorComponent extends Container implements Focusable {
 
 		const displayName = entry.fleetHost?.displayName ?? entry.hostname;
 		this.addChild(new Text(theme.fg("accent", ` ${displayName}`), 1, 0));
-		this.addChild(new Text(theme.fg("dim", ` ${entry.address} · ${entry.os ?? "?"}`), 1, 0));
-		this.addChild(new Spacer(1));
 
-		const actions: { key: string; label: string; desc: string }[] = [
-			{ key: "s", label: "Check status", desc: "Probe SSH, pi, daemon" },
-			{
-				key: "b",
-				label: "Bootstrap",
-				desc: entry.piVersion ? `Pi ${entry.piVersion} installed` : "Install pi + start daemon",
-			},
-			{ key: "c", label: "Connect", desc: "Mark as connected" },
-			{ key: "d", label: "Disconnect", desc: "Stop daemon on host" },
-			{ key: "e", label: "SSH", desc: "Open SSH session" },
-		];
-		if (entry.inFleet) {
+		if (entry.isCloud) {
+			// Cloud member (cloudflare, github-actions, custom)
+			this.addChild(new Text(theme.fg("dim", ` ${entry.transport} · ${entry.address}`), 1, 0));
+			if (entry.hasConfig) {
+				this.addChild(new Text(theme.fg("dim", ` Config: ${JSON.stringify(entry.config)}`), 1, 0));
+			} else {
+				this.addChild(new Text(theme.fg("warning", ` Not configured`), 1, 0));
+			}
+			this.addChild(new Spacer(1));
+
+			const actions: { key: string; label: string; desc: string }[] = [];
+
+			// Setup/connect — runs the transport's setup() (OAuth, repo creation, etc.)
+			if (!entry.hasConfig) {
+				actions.push({
+					key: "s",
+					label: "Setup",
+					desc: `Connect ${entry.transport} (login, create/select resources)`,
+				});
+			} else {
+				actions.push({ key: "s", label: "Reconfigure", desc: "Re-run setup (change repo, account, etc.)" });
+			}
+
+			// Config — set individual values
+			actions.push({ key: "c", label: "Set config", desc: "Set individual config value" });
+
+			// Common fleet actions
 			actions.push({ key: "n", label: "Rename", desc: "Set custom display name" });
-			actions.push({ key: "t", label: "Add tag", desc: "Tag this host" });
-			actions.push({ key: "x", label: "Remove from fleet", desc: "Unregister this host" });
-		} else {
-			actions.push({ key: "a", label: "Add to fleet", desc: `Tags: ${entry.tags.join(", ")}` });
-		}
+			actions.push({ key: "t", label: "Add tag", desc: "Tag this member" });
+			actions.push({ key: "x", label: "Remove from fleet", desc: "Unregister this member" });
 
-		for (const action of actions) {
-			this.addChild(
-				new Text(`  ${theme.fg("accent", action.key)}  ${action.label}  ${theme.fg("dim", action.desc)}`, 1, 0),
-			);
+			for (const action of actions) {
+				this.addChild(
+					new Text(`  ${theme.fg("accent", action.key)}  ${action.label}  ${theme.fg("dim", action.desc)}`, 1, 0),
+				);
+			}
+		} else {
+			// SSH host
+			this.addChild(new Text(theme.fg("dim", ` ${entry.address} · ${entry.os ?? "?"}`), 1, 0));
+			this.addChild(new Spacer(1));
+
+			const actions: { key: string; label: string; desc: string }[] = [
+				{ key: "s", label: "Check status", desc: "Probe SSH, pi, daemon" },
+				{
+					key: "b",
+					label: "Bootstrap",
+					desc: entry.piVersion ? `Pi ${entry.piVersion} installed` : "Install pi + start daemon",
+				},
+				{ key: "c", label: "Connect", desc: "Mark as connected" },
+				{ key: "d", label: "Disconnect", desc: "Stop daemon on host" },
+				{ key: "e", label: "SSH", desc: "Open SSH session" },
+			];
+			if (entry.inFleet) {
+				actions.push({ key: "n", label: "Rename", desc: "Set custom display name" });
+				actions.push({ key: "t", label: "Add tag", desc: "Tag this host" });
+				actions.push({ key: "x", label: "Remove from fleet", desc: "Unregister this host" });
+			} else {
+				actions.push({ key: "a", label: "Add to fleet", desc: `Tags: ${entry.tags.join(", ")}` });
+			}
+
+			for (const action of actions) {
+				this.addChild(
+					new Text(`  ${theme.fg("accent", action.key)}  ${action.label}  ${theme.fg("dim", action.desc)}`, 1, 0),
+				);
+			}
 		}
 		this.addChild(new Spacer(1));
 		this.addChild(new Text(theme.fg("dim", "  Press key to execute · esc to go back"), 1, 0));
@@ -491,20 +583,23 @@ export class FleetSelectorComponent extends Container implements Focusable {
 	handleInput(data: string): void {
 		const kb = getKeybindings();
 
-		// Rename/tag input mode
-		if (this._renaming || this._tagging) {
+		// Rename/tag/config input mode
+		if (this._renaming || this._tagging || this._configuring) {
 			if (kb.matches(data, "tui.select.confirm")) {
 				const value = this.searchInput.getValue().trim();
 				if (this._renaming && value) {
 					void this.confirmRename(value);
 				} else if (this._tagging && value) {
 					void this.confirmTag(value);
+				} else if (this._configuring && value) {
+					void this.confirmConfig(value);
 				}
 				return;
 			}
 			if (kb.matches(data, "tui.select.cancel")) {
 				this._renaming = false;
 				this._tagging = false;
+				this._configuring = false;
 				this.searchInput.setValue("");
 				this.statusText = "";
 				this.rebuildChildren();
@@ -628,6 +723,29 @@ export class FleetSelectorComponent extends Container implements Focusable {
 		const entry = this.selectedEntry;
 		if (!entry) return;
 
+		if (entry.isCloud) {
+			// Cloud member actions
+			switch (data) {
+				case "s":
+					void this.cloudAction("setup");
+					break;
+				case "c":
+					void this.cloudAction("config");
+					break;
+				case "n":
+					void this.hostAction("rename");
+					break;
+				case "t":
+					void this.hostAction("tag");
+					break;
+				case "x":
+					void this.hostAction("remove");
+					break;
+			}
+			return;
+		}
+
+		// SSH host actions
 		switch (data) {
 			case "s":
 				void this.hostAction("status");
@@ -880,6 +998,42 @@ export class FleetSelectorComponent extends Container implements Focusable {
 		await this.autoDiscover();
 	}
 
+	private async confirmConfig(input: string): Promise<void> {
+		const name = this._configTarget;
+		this._configuring = false;
+		this.searchInput.setValue("");
+		// Parse key=value
+		const eq = input.indexOf("=");
+		if (eq <= 0) {
+			this.statusText = `✗ Invalid format. Use key=value`;
+			this.rebuildChildren();
+			return;
+		}
+		const key = input.slice(0, eq).trim();
+		const rawVal = input.slice(eq + 1).trim();
+		let val: unknown = rawVal;
+		try {
+			val = JSON.parse(rawVal);
+		} catch {}
+		const { updateFleetMemberConfig } = await import("../../../cli/fleet/fleet-config.js");
+		const { savePluginConfig } = await import("../../../cli/fleet/runtime-operations.js");
+		const ok = await updateFleetMemberConfig(name, { [key]: val });
+		if (ok) {
+			// Sync to runtime plugin config
+			const { getFleetMember } = await import("../../../cli/fleet/fleet-config.js");
+			const member = await getFleetMember(name);
+			if (member?.transport && member.transport !== "ssh") {
+				savePluginConfig(member.transport, member.config ?? {});
+			}
+			this.statusText = `✓ Set ${name}.${key} = ${JSON.stringify(val)}`;
+		} else {
+			this.statusText = `✗ No fleet member named "${name}"`;
+		}
+		this.currentView = "main";
+		this.selectedEntry = null;
+		await this.autoDiscover();
+	}
+
 	// ─── Actions — all delegate to fleet-operations.ts ────────────────
 
 	private async hostAction(action: string): Promise<void> {
@@ -973,6 +1127,104 @@ export class FleetSelectorComponent extends Container implements Focusable {
 				this.rebuildChildren();
 				await sshIntoFleetHost(entry.hostname);
 				this.statusText = `SSH session ended`;
+				this.rebuildChildren();
+				break;
+			}
+		}
+	}
+
+	private async cloudAction(action: string): Promise<void> {
+		const entry = this.selectedEntry;
+		if (!entry || !entry.isCloud) return;
+		const transport = entry.transport ?? "custom";
+
+		switch (action) {
+			case "setup": {
+				this.setLoading(`Running ${transport} setup...`);
+				try {
+					const { runPluginSetupWithPath, savePluginConfig } = await import(
+						"../../../cli/fleet/runtime-operations.js"
+					);
+					const { pluginHasSetup } = await import("../../../cli/fleet/runtime-operations.js");
+					const { userRuntimesDir, builtinRuntimesDir } = await import(
+						"../../../core/fleet-runtime/runtime-plugin-loader.js"
+					);
+					const { join } = await import("node:path");
+					const { existsSync } = await import("node:fs");
+
+					// Find plugin path
+					const userPath = join(userRuntimesDir(), `${transport}.mjs`);
+					const builtinPath = join(builtinRuntimesDir(), `${transport}.mjs`);
+					const pluginPath = existsSync(userPath) ? userPath : existsSync(builtinPath) ? builtinPath : null;
+
+					if (!pluginPath) {
+						this.clearLoading();
+						this.statusText = `✗ No plugin found for ${transport}. Install with: fleet add ${transport}`;
+						this.rebuildChildren();
+						break;
+					}
+
+					if (!pluginHasSetup(pluginPath)) {
+						this.clearLoading();
+						this.statusText = `✗ ${transport} plugin has no setup() — configure manually with 'c'`;
+						this.rebuildChildren();
+						break;
+					}
+
+					// Run interactive setup (OAuth, repo creation, project selection, etc.)
+					const result = await runPluginSetupWithPath(pluginPath, {
+						ask: async (msg: string, defaultValue?: string) => {
+							this.statusText = `Setup: ${msg} → ${defaultValue ?? ""}`;
+							this.rebuildChildren();
+							return defaultValue ?? "";
+						},
+						confirm: async (msg: string, def?: boolean) => {
+							this.statusText = `Setup: ${msg} → ${def ?? true}`;
+							this.rebuildChildren();
+							return def ?? true;
+						},
+						choose: async (msg: string, options: string[]) => {
+							this.statusText = `Setup: ${msg} → ${options[0]}`;
+							this.rebuildChildren();
+							return 0;
+						},
+						status: (msg: string) => {
+							this.statusText = `Setup: ${msg}`;
+							this.rebuildChildren();
+						},
+					});
+
+					this.clearLoading();
+
+					if (result.success && result.config) {
+						// Save config to both fleet member and runtime plugin
+						savePluginConfig(transport, result.config);
+						const { updateFleetMemberConfig } = await import("../../../cli/fleet/fleet-config.js");
+						await updateFleetMemberConfig(entry.hostname, result.config);
+						entry.config = result.config;
+						entry.hasConfig = true;
+						this.statusText = `✓ ${transport} configured: ${JSON.stringify(result.config)}`;
+					} else if (result.message) {
+						this.statusText = result.success ? `✓ ${result.message}` : `✗ ${result.message}`;
+					} else {
+						this.statusText = `✓ ${transport} setup complete`;
+					}
+					this.rebuildChildren();
+				} catch (err) {
+					this.clearLoading();
+					this.statusText = `✗ Setup failed: ${err instanceof Error ? err.message : String(err)}`;
+					this.rebuildChildren();
+				}
+				break;
+			}
+			case "config": {
+				// Enter config-edit mode: prompt for key=value
+				this.searchInput.setValue("");
+				this.statusText = `Enter config for ${entry.hostname}: key=value (Enter to save, Esc to cancel)`;
+				this._renameTarget = entry.hostname;
+				this._renaming = false;
+				this._configTarget = entry.hostname;
+				this._configuring = true;
 				this.rebuildChildren();
 				break;
 			}
