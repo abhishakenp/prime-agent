@@ -14,8 +14,8 @@
  * Runtime adapters:
  * - LocalRuntime: in-process (existing behavior, default)
  * - SSHRuntime: SSH to a fleet host, run prime-agent --headless
- * - CloudflareRuntime: (future) deploy a CF Worker
- * - GitHubActionsRuntime: (future) trigger a GH Actions workflow
+ * - CloudflareRuntime: deploy a CF Worker
+ * - GitHubActionsRuntime: trigger a GH Actions workflow
  *
  * Usage from RLM:
  *   handle = await rlm("task", host="a2")        # SSH to VPS
@@ -41,6 +41,7 @@ export {
 	type SpawnRequest,
 	type SpawnResult,
 } from "./agent-runtime.js";
+export { CloudflareRuntime, type CloudflareRuntimeConfig } from "./cloudflare-runtime.js";
 export {
 	type FileSyncHandler,
 	type FileSyncRequest,
@@ -50,5 +51,6 @@ export {
 	validateSyncPath,
 } from "./file-sync.js";
 export { type FleetRlmChild, type FleetRlmSpawnParams, spawnFleetChild } from "./fleet-rlm-spawn.js";
+export { GitHubActionsRuntime, type GitHubActionsRuntimeConfig } from "./github-actions-runtime.js";
 export { LocalRuntime, type LocalSpawnHandlers } from "./local-runtime.js";
 export { SSHRuntime } from "./ssh-runtime.js";

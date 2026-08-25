@@ -53,6 +53,20 @@ export interface Args {
 	listModels?: string | true;
 	offline?: boolean;
 	verbose?: boolean;
+	/** Headless mode for fleet-spawned agents. */
+	headless?: boolean;
+	/** Prompt for headless mode. */
+	prompt?: string;
+	/** Session ID for headless mode. */
+	sessionId?: string;
+	/** Working directory for headless mode. */
+	workDir?: string;
+	/** RLM depth for fleet-spawned agents. */
+	rlmDepth?: number;
+	/** Parent agent ID for fleet-spawned agents. */
+	parentAgentId?: string;
+	/** Parent host for fleet-spawned agents. */
+	parentHost?: string;
 	messages: string[];
 	fileArgs: string[];
 	/** Unknown flags (potentially extension flags) - map of flag name to value */
@@ -294,6 +308,24 @@ export function parseArgs(args: string[]): Args {
 			result.verbose = true;
 		} else if (arg === "--offline") {
 			result.offline = true;
+		} else if (arg === "--headless") {
+			result.headless = true;
+			result.print = true;
+		} else if (arg === "--prompt" && i + 1 < args.length) {
+			result.prompt = args[++i];
+			result.messages.push(result.prompt);
+		} else if (arg === "--session-id" && i + 1 < args.length) {
+			result.sessionId = args[++i];
+		} else if (arg === "--work-dir" && i + 1 < args.length) {
+			result.workDir = args[++i];
+			result.cwd = result.workDir;
+		} else if (arg === "--depth" && i + 1 < args.length) {
+			const depth = Number.parseInt(args[++i], 10);
+			if (Number.isInteger(depth) && depth >= 0) result.rlmDepth = depth;
+		} else if (arg === "--parent-agent-id" && i + 1 < args.length) {
+			result.parentAgentId = args[++i];
+		} else if (arg === "--parent-host" && i + 1 < args.length) {
+			result.parentHost = args[++i];
 		} else if (arg.startsWith("@")) {
 			result.fileArgs.push(arg.slice(1)); // Remove @ prefix
 		} else if (arg.startsWith("--")) {

@@ -10682,9 +10682,11 @@ export class AgentSession {
 	 * 5. The child appears in the RLM child registry like any local child
 	 */
 	private async _startFleetRlmChild(prompt: string, kwargs: Record<string, unknown>): Promise<RlmSpawnHandle> {
-		const { RuntimeRegistry, SSHRuntime, LocalRuntime } = await import("./fleet-runtime/index.js");
+		const { RuntimeRegistry, SSHRuntime, LocalRuntime, CloudflareRuntime, GitHubActionsRuntime } = await import(
+			"./fleet-runtime/index.js"
+		);
 
-		// Build the runtime registry with SSH + local adapters
+		// Build the runtime registry with all adapters
 		const registry = new RuntimeRegistry();
 		registry.register(
 			new LocalRuntime({
@@ -10694,6 +10696,8 @@ export class AgentSession {
 			}),
 		);
 		registry.register(new SSHRuntime());
+		registry.register(new CloudflareRuntime());
+		registry.register(new GitHubActionsRuntime());
 
 		const { spawnFleetChild } = await import("./fleet-runtime/fleet-rlm-spawn.js");
 

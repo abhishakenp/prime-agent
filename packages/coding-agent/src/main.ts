@@ -1083,6 +1083,12 @@ export async function main(args: string[], options?: MainOptions) {
 	time("parseArgs");
 	const appMode = resolveAppMode(parsed, process.stdin.isTTY);
 
+	// Headless/fleet args: inject into env so AgentSession picks them up
+	if (parsed.rlmDepth !== undefined) process.env.RLM_DEPTH = String(parsed.rlmDepth);
+	if (parsed.parentAgentId) process.env.RLM_PARENT_NODE_ID = parsed.parentAgentId;
+	if (parsed.parentHost) process.env.RLM_PARENT_HOST = parsed.parentHost;
+	if (parsed.sessionId) process.env.PRIME_AGENT_SESSION_ID = parsed.sessionId;
+
 	if (shouldRejectNonInteractiveAttach(publicCommand.attachAgent, appMode)) {
 		console.error(chalk.red("Error: attach requires an interactive terminal"));
 		process.exit(1);

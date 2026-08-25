@@ -169,6 +169,11 @@ export function buildRlmPrompt(options: RlmPromptOptions): string {
 		parts.push(
 			"Spawn independent children in separate calls and end your turn instead of awaiting completion. Multiple replies may arrive over multiple turns. Delete a direct child explicitly with `await rlm.delete_subagent(child)` when it is no longer needed.",
 		);
+		// Fleet delegation: rlm() with host= parameter
+		parts.push(
+			"",
+			"Fleet delegation: `await rlm('task', host='a2')` spawns a child on a remote fleet host via SSH. Use `host='cloudflare'` for ephemeral Cloudflare Workers, `host='github'` for GitHub Actions runners. Omit `host` for local in-process spawn (default). Each remote agent is self-contained with its own working directory, kernel, and identity. Remote children can themselves spawn sub-agents on other hosts (recursive). Use fleet delegation for parallel compute across machines, specialized environments (GPU on VPS, CI on GitHub), or when local resources are saturated. List available hosts with `prime-agent fleet list` from a shell cell.",
+		);
 	}
 
 	if (hasIpython) {

@@ -2556,7 +2556,10 @@ export class AgentsViewMode implements Component, Focusable {
 			isSubagentSummary(row.summary) && !pendingDelete && !pendingKill && row.summary.model
 				? `${row.summary.model.provider}/${row.summary.model.id}${row.summary.thinkingLevel && row.summary.thinkingLevel !== "off" ? `:${row.summary.thinkingLevel}` : ""}`
 				: undefined;
-		const suffixes = [modelLabel, summaryText].filter(
+		// Fleet host badge — show when agent runs on a remote host
+		const fleetHost = !pendingDelete && !pendingKill ? (row.summary as { host?: string }).host : undefined;
+		const hostBadge = fleetHost && fleetHost !== "local" ? theme.fg("accent", `@${fleetHost}`) : undefined;
+		const suffixes = [modelLabel, hostBadge, summaryText].filter(
 			(suffix): suffix is string => suffix !== undefined && suffix.length > 0,
 		);
 		const titleContent = suffixes.length > 0 ? `${title} ${theme.fg("dim", `· ${suffixes.join(" · ")}`)}` : title;
