@@ -1,5 +1,9 @@
 /**
- * Fleet command — manage networked devices as a compute fleet.
+ * Fleet command — CLI entry point for managing networked devices.
+ *
+ * All business logic lives in fleet-operations.ts.
+ * This file is only: arg parsing + output formatting.
+ * Same operations are reused by the TUI component and /fleet slash command.
  *
  * Usage:
  *   prime-agent fleet                    Interactive TUI: list, add, remove, connect
@@ -18,19 +22,20 @@
  */
 
 import chalk from "chalk";
-import { bootstrapHost, checkHostStatus, disconnectHost } from "./bootstrap.js";
-import { discoverDevices, discoverDevicesQuick, inferTags } from "./discovery.js";
+import { discoverDevices, discoverDevicesQuick } from "./discovery.js";
+import { listFleetHosts } from "./fleet-config.js";
 import {
-	addFleetHost,
-	addFleetHostTag,
-	type FleetHost,
-	getFleetHost,
-	listFleetHosts,
-	removeFleetHost,
-	removeFleetHostTag,
-	renameFleetHost,
-	updateFleetHostStatus,
-} from "./fleet-config.js";
+	addHostToFleet,
+	bootstrapFleetHost,
+	checkFleetHostStatus,
+	connectFleetHost,
+	disconnectFleetHost,
+	removeHostFromFleet,
+	renameHostInFleet,
+	sshIntoFleetHost,
+	tagHostInFleet,
+	untagHostInFleet,
+} from "./fleet-operations.js";
 
 type FleetSubcommand =
 	| "list"
@@ -146,56 +151,37 @@ async function discoverFleet(args: string[]): Promise<void> {
 	const fleetNames = new Set(fleetHosts.map((h) => h.hostname.toLowerCase()));
 
 	console.log(chalk.dim("Scanning for networked devices..."));
-	const devices = quick ? await discoverDevicesQuick() : await discoverDevices({});
 
-	// Mark in-fleet devices
-	for (const device of devices) {
-		device.inFleet = fleetNames.has(device.hostname.toLowerCase());
-	}
+	const devices = quick ? await discoverDevicesQuick() : await discoverDevices({});
 
 	if (json) {
 		console.log(JSON.stringify({ devices }, null, 2));
 		return;
 	}
 
-	const online = devices.filter((d) => d.online !== false);
-	const offline = devices.filter((d) => d.online === false);
+	const online = devices.filter((d) => d.online);
+	const offline = devices.filter((d) => !d.online);
+	console.log(`\n  Discovered ${devices.length} devices (${online.length} online, ${offline.length} offline)\n`);
 
 	console.log(
-		chalk.bold(`\n  Discovered ${devices.length} devices (${online.length} online, ${offline.length} offline)\n`),
+		`  ${"HOSTNAME".padEnd(20)} ${"SOURCE".padEnd(12)} ${"OS".padEnd(8)} ${"SSH".padEnd(5)} ${"PI".padEnd(5)} ${"FLEET".padEnd(6)} ${"ADDRESS"}`,
+	);
+	console.log(
+		`  ${"─".repeat(20)} ${"─".repeat(12)} ${"─".repeat(8)} ${"─".repeat(5)} ${"─".repeat(5)} ${"─".repeat(6)} ${"─".repeat(16)}`,
 	);
 
-	if (online.length > 0) {
+	for (const device of devices) {
+		const inFleet = fleetNames.has(device.hostname.toLowerCase());
+		const ssh = device.sshable ? chalk.green("✓") : chalk.red("✗");
+		const pi = device.hasPi ? chalk.green("✓") : "-";
+		const fleet = inFleet ? chalk.green("✓") : "-";
+		const os = device.os ?? "?";
 		console.log(
-			`  ${"HOSTNAME".padEnd(22)} ${"SOURCE".padEnd(12)} ${"OS".padEnd(8)} ${"SSH".padEnd(5)} ${"PI".padEnd(5)} ${"FLEET".padEnd(6)} ${"ADDRESS"}`,
+			`  ${device.hostname.padEnd(20)} ${device.source.padEnd(12)} ${os.padEnd(8)} ${ssh.padEnd(5)} ${pi.padEnd(5)} ${fleet.padEnd(6)} ${device.tailscaleIp ?? device.address}`,
 		);
-		console.log(
-			`  ${"─".repeat(22)} ${"─".repeat(12)} ${"─".repeat(8)} ${"─".repeat(5)} ${"─".repeat(5)} ${"─".repeat(6)} ${"─".repeat(16)}`,
-		);
-
-		for (const device of online) {
-			const ssh = device.sshable ? chalk.green("✓") : chalk.red("✗");
-			const pi = device.hasPi ? chalk.green("✓") : chalk.dim("-");
-			const fleet = device.inFleet ? chalk.green("✓") : chalk.dim("-");
-			const os = device.os ?? "?";
-			console.log(
-				`  ${device.hostname.padEnd(22)} ${device.source.padEnd(12)} ${os.padEnd(8)} ${ssh}    ${pi}    ${fleet}    ${device.address}`,
-			);
-		}
 	}
 
-	if (offline.length > 0) {
-		console.log(chalk.dim(`\n  Offline devices (${offline.length}):`));
-		for (const device of offline) {
-			console.log(
-				chalk.dim(
-					`  ${device.hostname.padEnd(22)} ${device.source.padEnd(12)} ${device.os ?? "?"}   ${device.address}`,
-				),
-			);
-		}
-	}
-
-	const addable = online.filter((d) => d.sshable && !d.inFleet && !d.tags.includes("self"));
+	const addable = devices.filter((d) => !fleetNames.has(d.hostname.toLowerCase()) && d.sshable);
 	if (addable.length > 0) {
 		console.log(
 			chalk.cyan(`\n  ${addable.length} device(s) can be added. Run \`prime-agent fleet add <hostname>\` to add.`),
@@ -217,44 +203,24 @@ async function addHost(args: string[]): Promise<void> {
 	const tagsIdx = args.indexOf("--tags");
 	const tags = tagsIdx >= 0 ? (args[tagsIdx + 1]?.split(",") ?? []) : [];
 	const addrIdx = args.indexOf("--address");
-	const address = addrIdx >= 0 ? args[addrIdx + 1] : hostname;
-
-	// Check if already in fleet
-	const existing = await getFleetHost(hostname);
-	if (existing) {
-		console.error(chalk.red(`Host "${hostname}" is already in the fleet.`));
-		process.exitCode = 1;
-		return;
-	}
+	const address = addrIdx >= 0 ? args[addrIdx + 1] : undefined;
 
 	// Probe the host — use quick discovery (Tailscale + ARP cache, no ping sweep)
 	console.log(chalk.dim(`Probing ${hostname}...`));
 	const devices = await discoverDevicesQuick();
 	const device = devices.find((d) => d.hostname.toLowerCase() === hostname.toLowerCase());
 
-	const host: FleetHost = {
-		hostname,
-		address: address ?? device?.address ?? hostname,
-		tags: tags.length > 0 ? tags : device ? inferTags(device) : [],
-		capabilities: ["bash", "ipython", "browser"],
-		os: device?.os,
-		addedAt: Date.now(),
-		lastStatus: device?.sshable ? "disconnected" : "unreachable",
-	};
-
-	// If we discovered the device, use its info
-	if (device) {
-		host.os = device.os;
-		host.piVersion = device.piVersion;
-		if (device.sshable) host.lastStatus = "disconnected";
+	const result = await addHostToFleet(hostname, address, tags, device);
+	if (result.success) {
+		console.log(chalk.green(`✓ ${result.message}`));
+		if (result.host?.tags.length) console.log(chalk.dim(`  Tags: ${result.host.tags.join(", ")}`));
+		if (result.host?.os) console.log(chalk.dim(`  OS: ${result.host.os}`));
+		if (result.host?.piVersion) console.log(chalk.dim(`  Pi version: ${result.host.piVersion}`));
+		console.log(chalk.dim(`  Run \`prime-agent fleet bootstrap ${hostname}\` to install pi and start daemon.`));
+	} else {
+		console.error(chalk.red(result.message));
+		process.exitCode = 1;
 	}
-
-	await addFleetHost(host);
-	console.log(chalk.green(`✓ Added "${hostname}" to fleet.`));
-	if (host.tags.length > 0) console.log(chalk.dim(`  Tags: ${host.tags.join(", ")}`));
-	if (host.os) console.log(chalk.dim(`  OS: ${host.os}`));
-	if (host.piVersion) console.log(chalk.dim(`  Pi version: ${host.piVersion}`));
-	console.log(chalk.dim(`  Run \`prime-agent fleet bootstrap ${hostname}\` to install pi and start daemon.`));
 }
 
 // ─── remove ────────────────────────────────────────────────────────
@@ -266,11 +232,11 @@ async function removeHost(args: string[]): Promise<void> {
 		process.exitCode = 1;
 		return;
 	}
-	const removed = await removeFleetHost(hostname);
-	if (removed) {
-		console.log(chalk.green(`✓ Removed "${hostname}" from fleet.`));
+	const result = await removeHostFromFleet(hostname);
+	if (result.success) {
+		console.log(chalk.green(`✓ ${result.message}`));
 	} else {
-		console.error(chalk.red(`Host "${hostname}" not found in fleet.`));
+		console.error(chalk.red(result.message));
 		process.exitCode = 1;
 	}
 }
@@ -285,13 +251,11 @@ async function renameHost(args: string[]): Promise<void> {
 		process.exitCode = 1;
 		return;
 	}
-	const ok = await renameFleetHost(hostname, displayName);
-	if (ok) {
-		console.log(chalk.green(`✓ Renamed "${hostname}" → "${displayName}".`));
+	const result = await renameHostInFleet(hostname, displayName);
+	if (result.success) {
+		console.log(chalk.green(`✓ ${result.message}`));
 	} else {
-		console.error(
-			chalk.red(`Host "${hostname}" not found in fleet. Add it first: prime-agent fleet add ${hostname}`),
-		);
+		console.error(chalk.red(result.message));
 		process.exitCode = 1;
 	}
 }
@@ -305,11 +269,11 @@ async function tagHost(args: string[]): Promise<void> {
 		process.exitCode = 1;
 		return;
 	}
-	const ok = await addFleetHostTag(hostname, tag);
-	if (ok) {
-		console.log(chalk.green(`✓ Tagged "${hostname}" with "${tag}".`));
+	const result = await tagHostInFleet(hostname, tag);
+	if (result.success) {
+		console.log(chalk.green(`✓ ${result.message}`));
 	} else {
-		console.error(chalk.red(`Host "${hostname}" not found in fleet.`));
+		console.error(chalk.red(result.message));
 		process.exitCode = 1;
 	}
 }
@@ -321,11 +285,11 @@ async function untagHost(args: string[]): Promise<void> {
 		process.exitCode = 1;
 		return;
 	}
-	const ok = await removeFleetHostTag(hostname, tag);
-	if (ok) {
-		console.log(chalk.green(`✓ Removed tag "${tag}" from "${hostname}".`));
+	const result = await untagHostInFleet(hostname, tag);
+	if (result.success) {
+		console.log(chalk.green(`✓ ${result.message}`));
 	} else {
-		console.error(chalk.red(`Host "${hostname}" not found in fleet.`));
+		console.error(chalk.red(result.message));
 		process.exitCode = 1;
 	}
 }
@@ -339,15 +303,11 @@ async function sshHost(args: string[]): Promise<void> {
 		process.exitCode = 1;
 		return;
 	}
-	const host = await getFleetHost(hostname);
-	const target = host?.address ?? hostname;
-	const user = host?.user ? `${host.user}@` : "";
-	console.log(chalk.dim(`Connecting to ${user || ""}${target}...`));
-	const { spawn } = await import("node:child_process");
-	const ssh = spawn("ssh", [`${user}${target}`], { stdio: "inherit" });
-	ssh.on("exit", (code) => {
-		if (code) process.exitCode = code;
-	});
+	const result = await sshIntoFleetHost(hostname);
+	if (!result.success) {
+		console.error(chalk.red(result.message));
+		process.exitCode = 1;
+	}
 }
 
 // ─── connect ───────────────────────────────────────────────────────
@@ -355,25 +315,17 @@ async function sshHost(args: string[]): Promise<void> {
 async function connectHost(args: string[]): Promise<void> {
 	const hostname = args[0];
 	if (!hostname) {
-		console.error(
-			chalk.red("Usage: prime-agent fleet connect <hostname> [--gateway-url <url>] [--gateway-token <token>]"),
-		);
+		console.error(chalk.red("Usage: prime-agent fleet connect <hostname>"));
 		process.exitCode = 1;
 		return;
 	}
-	const host = await getFleetHost(hostname);
-	if (!host) {
-		console.error(
-			chalk.red(`Host "${hostname}" not found in fleet. Run \`prime-agent fleet add ${hostname}\` first.`),
-		);
+	const result = await connectFleetHost(hostname);
+	if (result.success) {
+		console.log(chalk.green(`✓ ${result.message}`));
+	} else {
+		console.error(chalk.red(result.message));
 		process.exitCode = 1;
-		return;
 	}
-	// This would start the gateway client on the remote host
-	// For now, just update status
-	await updateFleetHostStatus(hostname, "connected");
-	console.log(chalk.green(`✓ Marked "${hostname}" as connected.`));
-	console.log(chalk.dim("  (Full gateway client startup will be implemented in the next phase.)"));
 }
 
 // ─── disconnect ────────────────────────────────────────────────────
@@ -385,15 +337,13 @@ async function disconnectHostCmd(args: string[]): Promise<void> {
 		process.exitCode = 1;
 		return;
 	}
-	const host = await getFleetHost(hostname);
-	if (!host) {
-		console.error(chalk.red(`Host "${hostname}" not found in fleet.`));
+	const result = await disconnectFleetHost(hostname);
+	if (result.success) {
+		console.log(chalk.green(`✓ ${result.message}`));
+	} else {
+		console.error(chalk.red(result.message));
 		process.exitCode = 1;
-		return;
 	}
-	await disconnectHost(host.address);
-	await updateFleetHostStatus(hostname, "disconnected");
-	console.log(chalk.green(`✓ Disconnected "${hostname}".`));
 }
 
 // ─── status ────────────────────────────────────────────────────────
@@ -405,27 +355,41 @@ async function statusHost(args: string[]): Promise<void> {
 		process.exitCode = 1;
 		return;
 	}
-	const host = await getFleetHost(hostname);
-	if (!host) {
-		console.error(chalk.red(`Host "${hostname}" not found in fleet.`));
+	const json = args.includes("--json");
+	const result = await checkFleetHostStatus(hostname);
+
+	if (!result.success) {
+		console.error(chalk.red(result.message));
 		process.exitCode = 1;
 		return;
 	}
-	const json = args.includes("--json");
-	const status = await checkHostStatus(host.address);
 
 	if (json) {
-		console.log(JSON.stringify({ hostname, ...status }, null, 2));
+		console.log(
+			JSON.stringify(
+				{
+					hostname,
+					online: result.online,
+					piInstalled: result.piInstalled,
+					daemonRunning: result.daemonRunning,
+					piVersion: result.piVersion,
+				},
+				null,
+				2,
+			),
+		);
 		return;
 	}
 
 	console.log(chalk.bold(`\n  ${hostname}`));
-	console.log(`  Address:    ${host.address}`);
-	console.log(`  Tags:       ${host.tags.join(", ") || "-"}`);
-	console.log(`  Online:     ${status.online ? chalk.green("✓") : chalk.red("✗")}`);
-	console.log(`  Pi installed: ${status.piInstalled ? chalk.green("✓") : chalk.red("✗")}`);
-	if (status.piVersion) console.log(`  Pi version: ${status.piVersion}`);
-	console.log(`  Daemon:     ${status.daemonRunning ? chalk.green("running") : chalk.red("not running")}`);
+	if (result.host) {
+		console.log(`  Address:      ${result.host.address}`);
+		console.log(`  Tags:         ${result.host.tags.join(", ") || "-"}`);
+	}
+	console.log(`  Online:       ${result.online ? chalk.green("✓") : chalk.red("✗")}`);
+	console.log(`  Pi installed: ${result.piInstalled ? chalk.green("✓") : chalk.red("✗")}`);
+	if (result.piVersion) console.log(`  Pi version:   ${result.piVersion}`);
+	console.log(`  Daemon:       ${result.daemonRunning ? chalk.green("running") : chalk.red("not running")}`);
 	console.log();
 }
 
@@ -434,41 +398,18 @@ async function statusHost(args: string[]): Promise<void> {
 async function bootstrapHostCmd(args: string[]): Promise<void> {
 	const hostname = args[0];
 	if (!hostname) {
-		console.error(chalk.red("Usage: prime-agent fleet bootstrap <hostname> [--npm-package <pkg>]"));
+		console.error(chalk.red("Usage: prime-agent fleet bootstrap <hostname>"));
 		process.exitCode = 1;
 		return;
 	}
-	const host = await getFleetHost(hostname);
-	if (!host) {
-		console.error(
-			chalk.red(`Host "${hostname}" not found in fleet. Run \`prime-agent fleet add ${hostname}\` first.`),
-		);
-		process.exitCode = 1;
-		return;
-	}
-	const pkgIdx = args.indexOf("--npm-package");
-	const npmPackage = pkgIdx >= 0 ? args[pkgIdx + 1] : undefined;
 
 	console.log(chalk.dim(`Bootstrapping ${hostname}...`));
-	const result = await bootstrapHost({
-		target: host.address,
-		hostname: host.hostname,
-		tags: host.tags,
-		capabilities: host.capabilities,
-		npmPackage,
-	});
-
+	const result = await bootstrapFleetHost(hostname);
 	if (result.success) {
-		console.log(chalk.green(`✓ Bootstrap complete: ${hostname}`));
-		if (result.alreadyInstalled) {
-			console.log(chalk.dim("  Pi was already installed."));
-		} else {
-			console.log(chalk.dim("  Pi installed via npm."));
-		}
+		console.log(chalk.green(`✓ ${result.message}`));
 		if (result.piVersion) console.log(chalk.dim(`  Version: ${result.piVersion}`));
-		await updateFleetHostStatus(hostname, "connected");
 	} else {
-		console.error(chalk.red(`✗ Bootstrap failed: ${result.error}`));
+		console.error(chalk.red(`✗ ${result.message}`));
 		process.exitCode = 1;
 	}
 }

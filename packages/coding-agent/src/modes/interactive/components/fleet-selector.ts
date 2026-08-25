@@ -7,17 +7,20 @@
  */
 
 import { Container, type Focusable, fuzzyFilter, getKeybindings, Spacer, Text } from "@earendil-works/pi-tui";
-import { bootstrapHost, checkHostStatus, disconnectHost } from "../../../cli/fleet/bootstrap.js";
 import { type DiscoveredDevice, discoverStream, inferTags } from "../../../cli/fleet/discovery.js";
+import { type FleetHost, listFleetHosts } from "../../../cli/fleet/fleet-config.js";
 import {
-	addFleetHost,
-	addFleetHostTag,
-	type FleetHost,
-	listFleetHosts,
-	removeFleetHost,
-	renameFleetHost,
-	updateFleetHostStatus,
-} from "../../../cli/fleet/fleet-config.js";
+	addHostToFleet,
+	batchAddRemove,
+	bootstrapFleetHost,
+	checkFleetHostStatus,
+	connectFleetHost,
+	disconnectFleetHost,
+	removeHostFromFleet,
+	renameHostInFleet,
+	sshIntoFleetHost,
+	tagHostInFleet,
+} from "../../../cli/fleet/fleet-operations.js";
 import { theme } from "../theme/theme.js";
 import { getMenuListLayout, MenuList, MenuPanel, MenuRow, MenuSearchInput } from "./menu-panel.js";
 import { shouldTreatAsBack } from "./modal-back.js";
@@ -514,8 +517,8 @@ export class FleetSelectorComponent extends Container implements Focusable {
 		const hostname = this._renameTarget;
 		this._renaming = false;
 		this.searchInput.setValue("");
-		await renameFleetHost(hostname, newName);
-		this.statusText = `Renamed ${hostname} -> ${newName}`;
+		const result = await renameHostInFleet(hostname, newName);
+		this.statusText = result.success ? `✓ ${result.message}` : `✗ ${result.message}`;
 		this.currentView = "main";
 		this.selectedEntry = null;
 		await this.autoDiscover();
@@ -525,8 +528,8 @@ export class FleetSelectorComponent extends Container implements Focusable {
 		const hostname = this._tagTarget;
 		this._tagging = false;
 		this.searchInput.setValue("");
-		await addFleetHostTag(hostname, tag);
-		this.statusText = `Tagged ${hostname} with ${tag}`;
+		const result = await tagHostInFleet(hostname, tag);
+		this.statusText = result.success ? `✓ ${result.message}` : `✗ ${result.message}`;
 		this.currentView = "main";
 		this.selectedEntry = null;
 		await this.autoDiscover();
@@ -535,7 +538,15 @@ export class FleetSelectorComponent extends Container implements Focusable {
 	// ─── Actions ──────────────────────────────────────────────────────
 
 	private async batchAddRemove(): Promise<void> {
-		const toAdd: FleetEntry[] = [];
+		const toAdd: {
+			hostname: string;
+			address: string;
+			tags?: string[];
+			device?: DiscoveredDevice;
+			sshable?: boolean;
+			piVersion?: string;
+			os?: string;
+		}[] = [];
 		const toRemove: string[] = [];
 
 		for (const hostname of this.checkedSet) {
@@ -544,39 +555,28 @@ export class FleetSelectorComponent extends Container implements Focusable {
 			if (entry.inFleet) {
 				toRemove.push(hostname);
 			} else {
-				toAdd.push(entry);
+				toAdd.push({
+					hostname: entry.hostname,
+					address: entry.address,
+					tags: entry.tags.length > 0 ? entry.tags : undefined,
+					device: entry.device,
+					sshable: entry.sshable,
+					piVersion: entry.piVersion,
+					os: entry.os,
+				});
 			}
 		}
 
 		this.checkedSet.clear();
-
 		if (toAdd.length === 0 && toRemove.length === 0) return;
 
 		this.setLoading(`Adding ${toAdd.length}, removing ${toRemove.length}...`);
-
-		for (const entry of toAdd) {
-			const tags = entry.tags.length > 0 ? entry.tags : inferTags(entry.device ?? entryAsDevice(entry));
-			const host: FleetHost = {
-				hostname: entry.hostname,
-				address: entry.address,
-				tags,
-				capabilities: ["bash", "ipython", "browser"],
-				os: entry.os,
-				addedAt: Date.now(),
-				lastStatus: entry.sshable ? "disconnected" : "unreachable",
-				piVersion: entry.piVersion,
-			};
-			await addFleetHost(host);
-		}
-
-		for (const hostname of toRemove) {
-			await removeFleetHost(hostname);
-		}
-
+		const result = await batchAddRemove(toAdd, toRemove);
 		this.clearLoading();
+
 		const parts: string[] = [];
-		if (toAdd.length > 0) parts.push(`added ${toAdd.length}`);
-		if (toRemove.length > 0) parts.push(`removed ${toRemove.length}`);
+		if (result.added.length > 0) parts.push(`added ${result.added.length}`);
+		if (result.removed.length > 0) parts.push(`removed ${result.removed.length}`);
 		this.statusText = `✓ ${parts.join(", ")}`;
 		await this.autoDiscover();
 	}
@@ -588,18 +588,10 @@ export class FleetSelectorComponent extends Container implements Focusable {
 		switch (action) {
 			case "status": {
 				this.setLoading(`Probing ${entry.hostname}...`);
-				const status = await checkHostStatus(entry.address);
+				const result = await checkFleetHostStatus(entry.hostname);
 				this.clearLoading();
-				this.statusText = `${entry.hostname}: ${status.online ? "✓ online" : "✗ offline"} · pi ${status.piInstalled ? "✓" : "✗"} · daemon ${status.daemonRunning ? "✓" : "✗"}`;
-				if (entry.inFleet && entry.fleetHost) {
-					entry.fleetHost.piVersion = status.piVersion;
-					entry.fleetHost.lastStatus = status.online
-						? status.daemonRunning
-							? "connected"
-							: "disconnected"
-						: "unreachable";
-					await updateFleetHostStatus(entry.hostname, entry.fleetHost.lastStatus);
-				}
+				this.statusText = result.success ? result.message : `✗ ${result.message}`;
+				if (entry.fleetHost && result.piVersion) entry.fleetHost.piVersion = result.piVersion;
 				this.updateHeader();
 				this.updateList();
 				this.requestRender();
@@ -607,34 +599,9 @@ export class FleetSelectorComponent extends Container implements Focusable {
 			}
 			case "bootstrap": {
 				this.setLoading(`Bootstrapping ${entry.hostname}...`);
-				const result = await bootstrapHost({
-					target: entry.address,
-					hostname: entry.hostname,
-					tags: entry.tags,
-					capabilities: ["bash", "ipython", "browser"],
-				});
+				const result = await bootstrapFleetHost(entry.hostname, entry.address, entry.tags);
 				this.clearLoading();
-				if (result.success) {
-					this.statusText = `✓ Bootstrap complete: ${entry.hostname}`;
-					if (!entry.inFleet) {
-						const host: FleetHost = {
-							hostname: entry.hostname,
-							address: entry.address,
-							tags: entry.tags,
-							capabilities: ["bash", "ipython", "browser"],
-							os: entry.os,
-							addedAt: Date.now(),
-							lastStatus: "connected",
-							piVersion: result.piVersion,
-						};
-						await addFleetHost(host);
-					} else if (entry.fleetHost) {
-						entry.fleetHost.piVersion = result.piVersion;
-						await updateFleetHostStatus(entry.hostname, "connected");
-					}
-				} else {
-					this.statusText = `✗ Bootstrap failed: ${result.error}`;
-				}
+				this.statusText = result.success ? `✓ ${result.message}` : `✗ ${result.message}`;
 				this.currentView = "main";
 				this.selectedEntry = null;
 				await this.autoDiscover();
@@ -642,8 +609,8 @@ export class FleetSelectorComponent extends Container implements Focusable {
 			}
 			case "connect": {
 				if (entry.inFleet) {
-					await updateFleetHostStatus(entry.hostname, "connected");
-					this.statusText = `✓ ${entry.hostname} connected`;
+					const result = await connectFleetHost(entry.hostname);
+					this.statusText = result.success ? `✓ ${result.message}` : `✗ ${result.message}`;
 				}
 				this.currentView = "main";
 				this.selectedEntry = null;
@@ -653,10 +620,9 @@ export class FleetSelectorComponent extends Container implements Focusable {
 			}
 			case "disconnect": {
 				this.setLoading(`Disconnecting ${entry.hostname}...`);
-				await disconnectHost(entry.address);
+				const result = await disconnectFleetHost(entry.hostname);
 				this.clearLoading();
-				if (entry.inFleet) await updateFleetHostStatus(entry.hostname, "disconnected");
-				this.statusText = `✓ ${entry.hostname} disconnected`;
+				this.statusText = result.success ? `✓ ${result.message}` : `✗ ${result.message}`;
 				this.currentView = "main";
 				this.selectedEntry = null;
 				this.updateList();
@@ -664,27 +630,16 @@ export class FleetSelectorComponent extends Container implements Focusable {
 				break;
 			}
 			case "remove": {
-				await removeFleetHost(entry.hostname);
-				this.statusText = `✓ Removed ${entry.hostname}`;
+				const result = await removeHostFromFleet(entry.hostname);
+				this.statusText = result.success ? `✓ ${result.message}` : `✗ ${result.message}`;
 				this.currentView = "main";
 				this.selectedEntry = null;
 				await this.autoDiscover();
 				break;
 			}
 			case "add": {
-				const tags = entry.tags.length > 0 ? entry.tags : inferTags(entry.device ?? entryAsDevice(entry));
-				const host: FleetHost = {
-					hostname: entry.hostname,
-					address: entry.address,
-					tags,
-					capabilities: ["bash", "ipython", "browser"],
-					os: entry.os,
-					addedAt: Date.now(),
-					lastStatus: entry.sshable ? "disconnected" : "unreachable",
-					piVersion: entry.piVersion,
-				};
-				await addFleetHost(host);
-				this.statusText = `✓ Added ${entry.hostname}`;
+				const result = await addHostToFleet(entry.hostname, entry.address, entry.tags, entry.device);
+				this.statusText = result.success ? `✓ ${result.message}` : `✗ ${result.message}`;
 				this.currentView = "main";
 				this.selectedEntry = null;
 				await this.autoDiscover();
@@ -723,19 +678,15 @@ export class FleetSelectorComponent extends Container implements Focusable {
 				break;
 			}
 			case "ssh": {
-				const target = entry.address;
-				this.statusText = `SSH to ${target}...`;
+				this.statusText = `SSH to ${entry.address}...`;
 				this.updateHeader();
 				this.updateList();
 				this.requestRender();
-				const { spawn } = await import("node:child_process");
-				const ssh = spawn("ssh", [target], { stdio: "inherit" });
-				ssh.on("exit", () => {
-					this.statusText = `SSH session ended`;
-					this.updateHeader();
-					this.updateList();
-					this.requestRender();
-				});
+				await sshIntoFleetHost(entry.hostname);
+				this.statusText = `SSH session ended`;
+				this.updateHeader();
+				this.updateList();
+				this.requestRender();
 				break;
 			}
 		}
@@ -811,18 +762,4 @@ function mergeHostsAndDevices(fleetHosts: FleetHost[], devices: DiscoveredDevice
 	}
 
 	return entries;
-}
-
-function entryAsDevice(entry: FleetEntry): DiscoveredDevice {
-	return {
-		hostname: entry.hostname,
-		source: "arp",
-		address: entry.address,
-		os: entry.os,
-		online: entry.online,
-		sshable: entry.sshable,
-		hasPi: entry.hasPi,
-		piVersion: entry.piVersion,
-		tags: entry.tags,
-	};
 }
