@@ -238,44 +238,130 @@ async function discoverMdnsLinux(): Promise<DiscoveredDevice[]> {
 	}
 }
 
-// ─── ARP + ping sweep — all reachable IPs on local subnet ───────────
+// ─── Routing table + ARP — all reachable IPs on ALL connected networks ─
 
-async function discoverArp(): Promise<DiscoveredDevice[]> {
-	// Get local network interfaces and their subnets
-	const interfaces = networkInterfaces();
-	const localSubnets: string[] = [];
+/**
+ * Read the routing table to find ALL directly-connected networks.
+ * This catches local LAN (en0), VPN interfaces (utun0, wg0, tailscale0),
+ * Docker bridges (docker0), and any other interface the kernel knows about.
+ *
+ * Pure network — no config files, no platform-specific APIs.
+ */
+async function getConnectedSubnets(): Promise<{ subnet: string; cidr: number; interface: string }[]> {
+	// macOS: netstat -rn
+	// Linux: ip route
+	const isMac = process.platform === "darwin";
+	const subnets: { subnet: string; cidr: number; interface: string }[] = [];
 
-	for (const addrs of Object.values(interfaces)) {
-		if (!addrs) continue;
-		for (const addr of addrs) {
-			if (addr.family === "IPv4" && !addr.internal) {
-				// Extract subnet (e.g. 192.168.100.x -> 192.168.100)
-				const parts = addr.address.split(".");
-				if (parts.length === 4) {
-					localSubnets.push(`${parts[0]}.${parts[1]}.${parts[2]}`);
+	try {
+		if (isMac) {
+			const { stdout } = await execAsync("netstat -rn -f inet", { timeout: 3000 });
+			for (const line of stdout.split("\n")) {
+				// macOS netstat format:
+				// "192.168.100        link#11            UCS                   en0"  ← network route (3 octets)
+				// "192.168.100.1      f8:28:c9:..        UHLWIir               en0"  ← host route (4 octets)
+				// "100.64/10           link#21            UCS                 utun0"  ← CIDR route
+				const parts = line.trim().split(/\s+/);
+				if (parts.length < 4) continue;
+				const dest = parts[0];
+				const iface = parts[parts.length - 1];
+
+				// Skip default routes, link-local
+				if (dest === "default" || dest.startsWith("169.254")) continue;
+
+				let ip: string;
+				let cidr: number;
+
+				if (dest.includes("/")) {
+					const [ipPart, cidrPart] = dest.split("/");
+					ip = ipPart;
+					cidr = Number.parseInt(cidrPart, 10);
+				} else {
+					// No CIDR — on macOS, network routes show 3 octets (e.g. "192.168.100")
+					// Host routes show 4 octets (e.g. "192.168.100.1") — skip those
+					const octets = dest.split(".");
+					if (octets.length === 3) {
+						// Network route like "192.168.100" → /24
+						ip = `${dest}.0`;
+						cidr = 24;
+					} else if (octets.length === 4) {
+						// Host route — skip (individual host, not a network)
+						continue;
+					} else {
+						continue;
+					}
+				}
+
+				// Skip very large ranges (too slow to sweep)
+				if (cidr < 22) continue;
+				// Skip loopback
+				if (ip.startsWith("127.")) continue;
+				// Skip Tailscale 100.x — handled by Tailscale API
+				if (ip.startsWith("100.")) continue;
+				// Skip multicast
+				if (ip.startsWith("224.") || ip.startsWith("239.")) continue;
+
+				subnets.push({ subnet: ip, cidr, interface: iface });
+			}
+		} else {
+			// Linux: ip route
+			const { stdout } = await execAsync("ip -4 route show", { timeout: 3000 });
+			for (const line of stdout.split("\n")) {
+				// Format: "192.168.100.0/24 dev en0 proto kernel scope link src 192.168.100.81"
+				const match = line.match(/^(\d+\.\d+\.\d+\.\d+)\/(\d+).*dev\s+(\S+)/);
+				if (!match) continue;
+				const [, ip, cidrStr, iface] = match;
+				const cidr = Number.parseInt(cidrStr, 10);
+				if (cidr < 22) continue;
+				if (ip.startsWith("127.") || ip.startsWith("169.254")) continue;
+				if (ip.startsWith("100.")) continue;
+				subnets.push({ subnet: ip, cidr, interface: iface });
+			}
+		}
+	} catch {
+		// Fallback: use networkInterfaces()
+		const interfaces = networkInterfaces();
+		for (const [name, addrs] of Object.entries(interfaces)) {
+			if (!addrs) continue;
+			for (const addr of addrs) {
+				if (addr.family === "IPv4" && !addr.internal) {
+					const parts = addr.address.split(".");
+					if (parts.length === 4) {
+						subnets.push({ subnet: `${parts[0]}.${parts[1]}.${parts[2]}.0`, cidr: 24, interface: name });
+					}
 				}
 			}
 		}
 	}
 
-	if (localSubnets.length === 0) return [];
+	// Deduplicate
+	const seen = new Set<string>();
+	return subnets.filter((s) => {
+		const key = `${s.subnet}/${s.cidr}`;
+		if (seen.has(key)) return false;
+		seen.add(key);
+		return true;
+	});
+}
+
+async function discoverArp(): Promise<DiscoveredDevice[]> {
+	const subnets = await getConnectedSubnets();
+	if (subnets.length === 0) return [];
 
 	// Ping sweep all subnets in parallel to populate ARP table
-	await pingSweep(localSubnets);
+	await pingSweep(subnets);
 
-	// Read ARP table — all IPs that responded to ARP
+	// Read ARP table — all IPs that responded
 	const arpDevices = await readArpTable();
 	return arpDevices;
 }
 
-async function pingSweep(subnets: string[]): Promise<void> {
-	// Ping all 254 addresses in each subnet concurrently
-	// Use very short timeout — we just need to populate the ARP cache
+async function pingSweep(subnets: { subnet: string; cidr: number }[]): Promise<void> {
 	const pings: Promise<void>[] = [];
 
-	for (const subnet of subnets) {
-		for (let i = 1; i <= 254; i++) {
-			const ip = `${subnet}.${i}`;
+	for (const { subnet, cidr } of subnets) {
+		const hosts = getHostsInSubnet(subnet, cidr);
+		for (const ip of hosts) {
 			pings.push(
 				execAsync(`ping -c1 -W1 -t1 ${ip} 2>/dev/null || true`, { timeout: 2000 }).then(
 					() => {},
@@ -285,8 +371,55 @@ async function pingSweep(subnets: string[]): Promise<void> {
 		}
 	}
 
-	// Wait for all pings (they're fire-and-forget, just populating ARP cache)
 	await Promise.allSettled(pings);
+}
+
+/**
+ * Generate all host IPs in a subnet (excluding network and broadcast).
+ * Only supports /24 to /30 (smaller subnets — larger ones skipped earlier).
+ */
+function getHostsInSubnet(subnet: string, cidr: number): string[] {
+	const parts = subnet.split(".").map(Number);
+	if (parts.length !== 4) return [];
+
+	if (cidr === 24) {
+		const hosts: string[] = [];
+		for (let i = 1; i <= 254; i++) hosts.push(`${parts[0]}.${parts[1]}.${parts[2]}.${i}`);
+		return hosts;
+	}
+	if (cidr === 25) {
+		const base = parts[3] & 0xfe;
+		return [`${parts[0]}.${parts[1]}.${parts[2]}.${base + 1}`, `${parts[0]}.${parts[1]}.${parts[2]}.${base + 2}`];
+	}
+	if (cidr === 26) {
+		const base = parts[3] & 0xfc;
+		const hosts: string[] = [];
+		for (let i = 1; i <= 62; i++) hosts.push(`${parts[0]}.${parts[1]}.${parts[2]}.${base + i}`);
+		return hosts;
+	}
+	if (cidr === 27) {
+		const base = parts[3] & 0xf8;
+		const hosts: string[] = [];
+		for (let i = 1; i <= 30; i++) hosts.push(`${parts[0]}.${parts[1]}.${parts[2]}.${base + i}`);
+		return hosts;
+	}
+	if (cidr === 28) {
+		const base = parts[3] & 0xf0;
+		const hosts: string[] = [];
+		for (let i = 1; i <= 14; i++) hosts.push(`${parts[0]}.${parts[1]}.${parts[2]}.${base + i}`);
+		return hosts;
+	}
+	if (cidr === 30) {
+		const base = parts[3] & 0xfc;
+		return [`${parts[0]}.${parts[1]}.${parts[2]}.${base + 1}`, `${parts[0]}.${parts[1]}.${parts[2]}.${base + 2}`];
+	}
+	// /22 or larger — cap at 512 hosts
+	if (cidr <= 22) {
+		const hosts: string[] = [];
+		for (let i = 1; i <= 512 && i <= 1022; i++) hosts.push(`${parts[0]}.${parts[1]}.${parts[2]}.${i}`);
+		return hosts;
+	}
+	return [];
 }
 
 async function readArpTable(): Promise<DiscoveredDevice[]> {
