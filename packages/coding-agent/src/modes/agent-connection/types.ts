@@ -565,6 +565,12 @@ export interface AgentConnectionRlmChildAgentSnapshot {
 	sessionDir: string;
 	activity?: AgentConnectionRlmChildAgentActivity;
 	error?: string;
+	/** Hostname where this child is running. Set when running on a remote fleet host. */
+	host?: string;
+	/** Tags of the host where this child is running. */
+	hostTags?: string[];
+	/** Children of this child (for recursive tree view). */
+	children?: AgentConnectionRlmChildAgentSnapshot[];
 }
 
 export type AgentConnectionSessionEvent =

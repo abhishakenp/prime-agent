@@ -176,6 +176,52 @@ export const COMMAND_SPECS: readonly CommandSpec[] = [
 		usage: "config",
 		summary: "Configure package resources",
 	},
+	{
+		path: ["fleet"],
+		usage: "fleet [list|discover|add|remove|connect|disconnect|status|bootstrap]",
+		summary: "Manage networked device fleet",
+		description: "Discover, add, remove, and manage remote hosts for distributed agent execution.",
+	},
+	{
+		path: ["fleet", "list"],
+		usage: "fleet list [--json]",
+		summary: "List all fleet hosts",
+	},
+	{
+		path: ["fleet", "discover"],
+		usage: "fleet discover [--json] [--no-probe]",
+		summary: "Scan for accessible networked devices",
+	},
+	{
+		path: ["fleet", "add"],
+		usage: "fleet add <hostname> [--tags tag1,tag2] [--address <ip>]",
+		summary: "Add a host to the fleet",
+	},
+	{
+		path: ["fleet", "remove"],
+		usage: "fleet remove <hostname>",
+		summary: "Remove a host from the fleet",
+	},
+	{
+		path: ["fleet", "connect"],
+		usage: "fleet connect <hostname>",
+		summary: "Connect a host to the gateway",
+	},
+	{
+		path: ["fleet", "disconnect"],
+		usage: "fleet disconnect <hostname>",
+		summary: "Disconnect a host from the gateway",
+	},
+	{
+		path: ["fleet", "status"],
+		usage: "fleet status <hostname> [--json]",
+		summary: "Check a host's status",
+	},
+	{
+		path: ["fleet", "bootstrap"],
+		usage: "fleet bootstrap <hostname> [--npm-package <pkg>]",
+		summary: "Install pi on a host and start daemon",
+	},
 ];
 
 export const PUBLIC_COMMAND_NAMES = new Set(

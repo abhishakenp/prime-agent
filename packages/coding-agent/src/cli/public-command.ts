@@ -18,6 +18,7 @@ import {
 import { handleDaemonCommand } from "./daemon-command.js";
 import { runPs, runReap, runShutdownAll } from "./daemon-ps.js";
 import { DAEMON_UPDATE_RESTART_COORDINATOR_FLAG } from "./daemon-update-restart.js";
+import { handleFleetCommand } from "./fleet/index.js";
 
 export interface PublicCommandResult {
 	handled: boolean;
@@ -145,6 +146,9 @@ async function runPublicCommand(args: string[]): Promise<PublicCommandResult> {
 		case "config":
 			if (!requireArgumentCount(args.slice(1), 0, "config")) return HANDLED;
 			return continueWith(args);
+		case "fleet":
+			await handleFleetCommand(args.slice(1));
+			return HANDLED;
 		default:
 			return continueWith(args);
 	}

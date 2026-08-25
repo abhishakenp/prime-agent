@@ -194,6 +194,12 @@ const CANONICAL_BUILTIN_SLASH_COMMANDS: ReadonlyArray<BuiltinSlashCommand> = [
 	},
 	{ name: "reload", description: "Reload keybindings, extensions, skills, prompts, and themes" },
 	{
+		name: "fleet",
+		description: "Manage networked device fleet (list, discover, add, remove, status)",
+		argumentHint: "[list|discover|add|remove|status|bootstrap]",
+		takesArgument: true,
+	},
+	{
 		name: "fullscreen",
 		description: "Toggle fullscreen (alternate screen) rendering with scrollable transcript",
 		argumentHint: "[on|off]",

@@ -4778,6 +4778,12 @@ export class InteractiveMode {
 					this.editor.setText("");
 					return;
 				}
+				if (commandName === "fleet") {
+					this.echoLocalCommand(text);
+					await this.handleFleetSlashCommand(commandArgs);
+					this.editor.setText("");
+					return;
+				}
 				if (commandName === "hotkeys" && !commandArgs) {
 					this.echoLocalCommand(text);
 					this.handleHotkeysCommand();
@@ -9702,6 +9708,40 @@ export class InteractiveMode {
 		this.chatContainer.addChild(new Text(theme.bold(theme.fg("accent", "What's New")), 1, 0));
 		this.chatContainer.addChild(new Spacer(1));
 		this.chatContainer.addChild(new Markdown(changelogMarkdown, 1, 1, this.getMarkdownThemeWithSettings()));
+		this.chatContainer.addChild(new DynamicBorder());
+		this.ui.requestRender();
+	}
+
+	private async handleFleetSlashCommand(args: string | undefined): Promise<void> {
+		const { handleFleetCommand } = await import("../../cli/fleet/index.js");
+		const fleetArgs = args ? args.trim().split(/\s+/) : [];
+
+		// Capture stdout to render in the chat
+		const lines: string[] = [];
+		const origLog = console.log;
+		const origErr = console.error;
+		console.log = (...parts: unknown[]) => {
+			lines.push(parts.map(String).join(" "));
+		};
+		console.error = (...parts: unknown[]) => {
+			lines.push(parts.map(String).join(" "));
+		};
+
+		try {
+			await handleFleetCommand(fleetArgs);
+		} catch (err) {
+			lines.push(`Error: ${err instanceof Error ? err.message : String(err)}`);
+		} finally {
+			console.log = origLog;
+			console.error = origErr;
+		}
+
+		this.chatContainer.addChild(new Spacer(1));
+		this.chatContainer.addChild(new DynamicBorder());
+		this.chatContainer.addChild(new Text(theme.bold(theme.fg("accent", "Fleet")), 1, 0));
+		this.chatContainer.addChild(new Spacer(1));
+		const output = lines.length > 0 ? lines.join("\n") : "No output.";
+		this.chatContainer.addChild(new Markdown(`\`\`\`\n${output}\n\`\`\``, 1, 1, this.getMarkdownThemeWithSettings()));
 		this.chatContainer.addChild(new DynamicBorder());
 		this.ui.requestRender();
 	}
