@@ -172,19 +172,19 @@ export function buildRlmPrompt(options: RlmPromptOptions): string {
 		// Fleet delegation: rlm() with host= parameter
 		parts.push(
 			"",
-			"Fleet delegation: `await rlm('task', host='a2')` spawns a child on a remote fleet host via SSH. Use `host='cloudflare'` for ephemeral Cloudflare Workers, `host='github'` for GitHub Actions runners. Omit `host` for local in-process spawn (default). Each remote agent is self-contained with its own working directory, kernel, and identity. Remote children can themselves spawn sub-agents on other hosts (recursive). Use fleet delegation for parallel compute across machines, specialized environments (GPU on VPS, CI on GitHub), or when local resources are saturated.",
+			"Fleet delegation: `await rlm('task', host='a2')` spawns a child on a fleet member. Each member is a target — SSH host, Cloudflare Workers, GitHub Actions, or custom transport. Omit `host` for local in-process spawn (default). Each remote agent is self-contained with its own working directory, kernel, and identity. Remote children can themselves spawn sub-agents on other fleet members (recursive). Use fleet delegation for parallel compute across machines, specialized environments (GPU on VPS, CI on GitHub), or when local resources are saturated.",
 			"",
-			"Runtime adapters bridge fleet hosts to execution platforms. Discover and manage them from shell cells:",
-			"- `prime-agent fleet list` — show fleet hosts (SSH-accessible machines)",
-			"- `prime-agent fleet runtimes list` — show all runtime adapters (SSH, Cloudflare, GitHub Actions, custom) with status and config",
-			"- `prime-agent fleet runtimes list --json` — machine-readable output for programmatic inspection",
-			"- `prime-agent fleet runtimes install <name> --no-setup` — install a runtime adapter without interactive prompts",
-			"- `prime-agent fleet runtimes install <name> --config=key=value` — install + configure in one non-interactive command",
-			"- `prime-agent fleet runtimes setup <name> --config=key=value` — reconfigure an installed adapter non-interactively",
-			"- `prime-agent fleet runtimes config <name> <key> <value>` — set individual config values",
-			"- `prime-agent fleet runtimes enable <name>` / `disable <name>` — toggle adapter availability",
+			"Fleet management from shell cells:",
+			"- `prime-agent fleet list` — show all fleet members (SSH hosts + cloud platforms) with transport, status, config",
+			"- `prime-agent fleet list --json` — machine-readable output for programmatic inspection",
+			"- `prime-agent fleet add <hostname>` — add an SSH host (auto-probes Tailscale/ARP)",
+			"- `prime-agent fleet add cloudflare` — add Cloudflare Workers as a fleet member",
+			"- `prime-agent fleet add github-actions --config=repo=owner/name` — add GitHub Actions as a fleet member",
+			"- `prime-agent fleet remove <name>` — remove any fleet member",
+			"- `prime-agent fleet config <name> <key> <value>` — configure any member (SSH user, CF accountId, GH repo, etc.)",
+			"- `prime-agent fleet rename <name> <display>` / `tag <name> <tag>` / `untag <name> <tag>`",
 			"",
-			"Available runtime adapters: `ssh` (built-in, fleet hosts), `cloudflare` (Cloudflare Workers, needs wrangler login), `github-actions` (GitHub Actions, needs a dedicated repo). To set up GitHub Actions: create a repo with `gh repo create <name> --public` then `prime-agent fleet runtimes install github-actions --config=repo=<owner>/<name>`. To set up Cloudflare: run `npx wrangler whoami` to verify login, then `prime-agent fleet runtimes install cloudflare --config=accountId=<id>`. Agents can fully provision and configure adapters without human intervention.",
+			"Transports: `ssh` (fleet hosts over SSH), `cloudflare` (Cloudflare Workers, needs wrangler login), `github-actions` (GitHub Actions, needs a dedicated repo). To provision GitHub Actions: `gh repo create prime-agent-runs --public` then `prime-agent fleet add github-actions --config=repo=owner/prime-agent-runs`. To provision Cloudflare: `npx wrangler whoami` then `prime-agent fleet add cloudflare --config=accountId=<id>`. Agents can fully provision and configure fleet members without human intervention.",
 		);
 	}
 

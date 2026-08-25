@@ -23,18 +23,27 @@
 
 import chalk from "chalk";
 import { discoverDevices, discoverDevicesQuick } from "./discovery.js";
-import { listFleetHosts } from "./fleet-config.js";
+import {
+	addFleetMember,
+	addFleetMemberTag,
+	type FleetMember,
+	type FleetTransport,
+	getFleetMember,
+	importRuntimeMembers,
+	listFleetHosts,
+	listFleetMembers,
+	removeFleetMember,
+	removeFleetMemberTag,
+	renameFleetMember,
+	updateFleetMemberConfig,
+} from "./fleet-config.js";
 import {
 	addHostToFleet,
 	bootstrapFleetHost,
 	checkFleetHostStatus,
 	connectFleetHost,
 	disconnectFleetHost,
-	removeHostFromFleet,
-	renameHostInFleet,
 	sshIntoFleetHost,
-	tagHostInFleet,
-	untagHostInFleet,
 } from "./fleet-operations.js";
 import {
 	configureRuntimePlugin,
@@ -53,6 +62,7 @@ type FleetSubcommand =
 	| "rename"
 	| "tag"
 	| "untag"
+	| "config"
 	| "connect"
 	| "disconnect"
 	| "ssh"
@@ -91,6 +101,9 @@ export async function handleFleetCommand(args: string[]): Promise<void> {
 		case "untag":
 			await untagHost(rest);
 			break;
+		case "config":
+			await configMember(rest);
+			break;
 		case "connect":
 			await connectHost(rest);
 			break;
@@ -120,62 +133,54 @@ export async function handleFleetCommand(args: string[]): Promise<void> {
 
 async function listFleet(args: string[]): Promise<void> {
 	const json = args.includes("--json");
-	const hosts = await listFleetHosts();
-	const plugins = await listRuntimePlugins();
-	const activeRuntimes = plugins.filter((p) => p.active);
+	// Import runtime configs as fleet members (idempotent)
+	await importRuntimeMembers();
+	const members = await listFleetMembers();
 
 	if (json) {
-		console.log(JSON.stringify({ hosts, runtimes: activeRuntimes }, null, 2));
+		console.log(JSON.stringify({ members }, null, 2));
 		return;
 	}
 
-	if (hosts.length === 0 && activeRuntimes.length === 0) {
-		console.log(chalk.dim("No hosts or runtimes. Run `prime-agent fleet discover` to find devices."));
-		console.log(chalk.dim("Install runtime adapters with `prime-agent fleet runtimes install <name>`"));
+	if (members.length === 0) {
+		console.log(chalk.dim("No fleet members. Run `prime-agent fleet discover` to find devices."));
+		console.log(
+			chalk.dim("Add cloud members: `prime-agent fleet add cloudflare` or `prime-agent fleet add github-actions`"),
+		);
 		return;
 	}
 
-	if (hosts.length > 0) {
-		console.log(chalk.bold("\n  Fleet Hosts (SSH-accessible machines)\n"));
-		console.log(
-			`  ${"NAME".padEnd(20)} ${"HOSTNAME".padEnd(20)} ${"ADDRESS".padEnd(20)} ${"TAGS".padEnd(20)} ${"STATUS".padEnd(12)} ${"PI"}`,
-		);
-		console.log(
-			`  ${"─".repeat(20)} ${"─".repeat(20)} ${"─".repeat(20)} ${"─".repeat(20)} ${"─".repeat(12)} ${"─".repeat(10)}`,
-		);
+	console.log(chalk.bold("\n  Fleet Members\n"));
+	console.log(
+		`  ${"NAME".padEnd(18)} ${"TRANSPORT".padEnd(16)} ${"ADDRESS".padEnd(20)} ${"TAGS".padEnd(20)} ${"STATUS".padEnd(12)} ${"CONFIG"}`,
+	);
+	console.log(
+		`  ${"─".repeat(18)} ${"─".repeat(16)} ${"─".repeat(20)} ${"─".repeat(20)} ${"─".repeat(12)} ${"─".repeat(8)}`,
+	);
 
-		for (const host of hosts) {
-			const status = host.lastStatus ?? "unknown";
-			const statusColor =
-				status === "connected" ? chalk.green : status === "disconnected" ? chalk.yellow : chalk.dim;
-			const tags = host.tags.join(",") || "-";
-			const name = host.displayName ?? host.hostname;
-			const nameCol = host.displayName ? chalk.cyan(name) : name;
-			console.log(
-				`  ${nameCol.padEnd(20)} ${host.hostname.padEnd(20)} ${host.address.padEnd(20)} ${tags.padEnd(20)} ${statusColor(status.padEnd(12))} ${host.piVersion ?? "-"}`,
-			);
-		}
-		console.log();
-	}
-
-	if (activeRuntimes.length > 0) {
-		console.log(chalk.bold("  Runtime Adapters (cloud + custom platforms)\n"));
-		console.log(`  ${"NAME".padEnd(18)} ${"PLATFORM".padEnd(16)} ${"SOURCE".padEnd(10)} ${"CONFIG"}`);
-		console.log(`  ${"─".repeat(18)} ${"─".repeat(16)} ${"─".repeat(10)} ${"─".repeat(10)}`);
-		for (const rt of activeRuntimes) {
-			const name = rt.source === "builtin" ? chalk.cyan(rt.name) : chalk.green(rt.name);
-			const config = rt.hasConfig ? chalk.green("✓") : "-";
-			console.log(`  ${name.padEnd(18)} ${rt.platform.padEnd(16)} ${rt.source.padEnd(10)} ${config}`);
-		}
-		console.log();
+	for (const m of members) {
+		const name = m.displayName ?? m.name;
+		const nameCol = m.displayName ? chalk.cyan(name) : m.transport === "ssh" ? chalk.green(name) : name;
+		const transportCol = chalk.dim(m.transport);
+		const address = m.address ?? (m.config?.repo as string) ?? (m.config?.accountId as string) ?? "-";
+		const tags = m.tags.join(",") || "-";
+		const status = m.lastStatus ?? (m.enabled === false ? "inactive" : "unknown");
+		const statusColor =
+			status === "connected" || status === "active"
+				? chalk.green
+				: status === "disconnected" || status === "inactive"
+					? chalk.yellow
+					: chalk.dim;
+		const hasConfig = m.config && Object.keys(m.config).length > 0 ? chalk.green("✓") : "-";
 		console.log(
-			chalk.dim(
-				"  Use host='ssh' or host='<fleet-hostname>' for SSH, host='cloudflare' for CF Workers, host='github' for GH Actions",
-			),
+			`  ${nameCol.padEnd(18)} ${transportCol.padEnd(16)} ${address.padEnd(20)} ${tags.padEnd(20)} ${statusColor(status.padEnd(12))} ${hasConfig}`,
 		);
-		console.log(chalk.dim("  Manage: prime-agent fleet runtimes list | install | setup | config | enable | disable"));
-		console.log();
 	}
+	console.log();
+	console.log(chalk.dim("  Spawn: host='<name>' in rlm(). SSH hosts use hostname, cloud members use transport name."));
+	console.log(chalk.dim("  Manage: prime-agent fleet add/remove/rename/tag/config <name>"));
+	console.log(chalk.dim("  Add cloud: prime-agent fleet add cloudflare | prime-agent fleet add github-actions"));
+	console.log();
 }
 
 // ─── discover ──────────────────────────────────────────────────────
@@ -229,13 +234,29 @@ async function discoverFleet(args: string[]): Promise<void> {
 // ─── add ───────────────────────────────────────────────────────────
 
 async function addHost(args: string[]): Promise<void> {
-	const hostname = args[0];
-	if (!hostname) {
-		console.error(chalk.red("Usage: prime-agent fleet add <hostname> [--tags tag1,tag2] [--address <ip>]"));
+	const target = args[0];
+	if (!target) {
+		console.error(
+			chalk.red(
+				"Usage: prime-agent fleet add <hostname|transport> [name] [--tags ...] [--address ...] [--config k=v]",
+			),
+		);
+		console.error(chalk.red("  SSH: prime-agent fleet add a2 --address 100.94.97.42"));
+		console.error(chalk.red("  Cloud: prime-agent fleet add cloudflare"));
+		console.error(chalk.red("  Cloud: prime-agent fleet add github-actions --config=repo=owner/repo"));
 		process.exitCode = 1;
 		return;
 	}
 
+	// Check if target is a transport type (cloudflare, github-actions, custom)
+	const cloudTransports: FleetTransport[] = ["cloudflare", "github-actions", "custom"];
+	if (cloudTransports.includes(target as FleetTransport)) {
+		await addCloudMember(target as FleetTransport, args.slice(1));
+		return;
+	}
+
+	// Otherwise treat as SSH host
+	const hostname = target;
 	const tagsIdx = args.indexOf("--tags");
 	const tags = tagsIdx >= 0 ? (args[tagsIdx + 1]?.split(",") ?? []) : [];
 	const addrIdx = args.indexOf("--address");
@@ -259,20 +280,95 @@ async function addHost(args: string[]): Promise<void> {
 	}
 }
 
+async function addCloudMember(transport: FleetTransport, args: string[]): Promise<void> {
+	// Parse optional name (defaults to transport name)
+	const name = args[0] && !args[0].startsWith("--") ? args[0] : transport;
+	const configArgs = args.filter((a) => a.startsWith("--config="));
+	const inlineConfig: Record<string, unknown> = {};
+	for (const ca of configArgs) {
+		const kv = ca.slice("--config=".length);
+		const eq = kv.indexOf("=");
+		if (eq > 0) {
+			const key = kv.slice(0, eq);
+			let val: unknown = kv.slice(eq + 1);
+			try {
+				val = JSON.parse(val as string);
+			} catch {}
+			inlineConfig[key] = val;
+		}
+	}
+
+	// Install the transport plugin if not already installed
+	const plugins = await listRuntimePlugins();
+	const existing = plugins.find((p) => p.name === transport);
+	if (!existing) {
+		console.log(chalk.dim(`Installing ${transport} transport...`));
+		const result = installRuntimePlugin(transport);
+		if (!result.success) {
+			console.error(chalk.red(result.message));
+			process.exitCode = 1;
+			return;
+		}
+		console.log(chalk.green(`✓ ${result.message}`));
+	}
+
+	// If inline config provided, save it
+	if (Object.keys(inlineConfig).length > 0) {
+		const { savePluginConfig } = await import("./runtime-operations.js");
+		savePluginConfig(transport, inlineConfig);
+		console.log(chalk.dim(`  Config saved: ${JSON.stringify(inlineConfig)}`));
+	}
+
+	// Add as fleet member
+	await importRuntimeMembers(); // Import any existing config first
+	const member: FleetMember = {
+		name,
+		transport,
+		tags: ["cloud", transport],
+		addedAt: Date.now(),
+		lastStatus: "active",
+		enabled: true,
+		config: Object.keys(inlineConfig).length > 0 ? inlineConfig : undefined,
+	};
+	await addFleetMember(member);
+	console.log(chalk.green(`✓ Added fleet member: ${name} (transport: ${transport})`));
+	if (Object.keys(inlineConfig).length > 0) {
+		console.log(chalk.dim(`  Config: ${JSON.stringify(inlineConfig)}`));
+	} else {
+		// Check if there's existing config from the plugin
+		const existingMember = await getFleetMember(name);
+		if (existingMember?.config && Object.keys(existingMember.config).length > 0) {
+			console.log(chalk.dim(`  Config: ${JSON.stringify(existingMember.config)}`));
+		} else {
+			console.log(chalk.dim(`  No config yet. Run: prime-agent fleet config ${name} <key> <value>`));
+			if (transport === "github-actions") {
+				console.log(
+					chalk.dim(
+						`  Or: gh repo create prime-agent-runs --public && prime-agent fleet config ${name} repo "owner/prime-agent-runs"`,
+					),
+				);
+			} else if (transport === "cloudflare") {
+				console.log(chalk.dim(`  Or: npx wrangler whoami && prime-agent fleet config ${name} accountId <id>`));
+			}
+		}
+	}
+	console.log(chalk.dim(`  Spawn with: host='${name}' in rlm()`));
+}
+
 // ─── remove ────────────────────────────────────────────────────────
 
 async function removeHost(args: string[]): Promise<void> {
-	const hostname = args[0];
-	if (!hostname) {
-		console.error(chalk.red("Usage: prime-agent fleet remove <hostname>"));
+	const name = args[0];
+	if (!name) {
+		console.error(chalk.red("Usage: prime-agent fleet remove <name>"));
 		process.exitCode = 1;
 		return;
 	}
-	const result = await removeHostFromFleet(hostname);
-	if (result.success) {
-		console.log(chalk.green(`✓ ${result.message}`));
+	const removed = await removeFleetMember(name);
+	if (removed) {
+		console.log(chalk.green(`✓ Removed fleet member: ${name}`));
 	} else {
-		console.error(chalk.red(result.message));
+		console.error(chalk.red(`No fleet member named "${name}"`));
 		process.exitCode = 1;
 	}
 }
@@ -280,18 +376,18 @@ async function removeHost(args: string[]): Promise<void> {
 // ─── rename ────────────────────────────────────────────────────────
 
 async function renameHost(args: string[]): Promise<void> {
-	const [hostname, ...nameParts] = args;
+	const [name, ...nameParts] = args;
 	const displayName = nameParts.join(" ").trim();
-	if (!hostname || !displayName) {
-		console.error(chalk.red("Usage: prime-agent fleet rename <hostname> <new-name>"));
+	if (!name || !displayName) {
+		console.error(chalk.red("Usage: prime-agent fleet rename <name> <new-display-name>"));
 		process.exitCode = 1;
 		return;
 	}
-	const result = await renameHostInFleet(hostname, displayName);
-	if (result.success) {
-		console.log(chalk.green(`✓ ${result.message}`));
+	const result = await renameFleetMember(name, displayName);
+	if (result) {
+		console.log(chalk.green(`✓ Renamed ${name} → ${displayName}`));
 	} else {
-		console.error(chalk.red(result.message));
+		console.error(chalk.red(`No fleet member named "${name}"`));
 		process.exitCode = 1;
 	}
 }
@@ -299,33 +395,95 @@ async function renameHost(args: string[]): Promise<void> {
 // ─── tag / untag ────────────────────────────────────────────────────
 
 async function tagHost(args: string[]): Promise<void> {
-	const [hostname, tag] = args;
-	if (!hostname || !tag) {
-		console.error(chalk.red("Usage: prime-agent fleet tag <hostname> <tag>"));
+	const [name, tag] = args;
+	if (!name || !tag) {
+		console.error(chalk.red("Usage: prime-agent fleet tag <name> <tag>"));
 		process.exitCode = 1;
 		return;
 	}
-	const result = await tagHostInFleet(hostname, tag);
-	if (result.success) {
-		console.log(chalk.green(`✓ ${result.message}`));
+	const result = await addFleetMemberTag(name, tag);
+	if (result) {
+		console.log(chalk.green(`✓ Tagged ${name}: ${tag}`));
 	} else {
-		console.error(chalk.red(result.message));
+		console.error(chalk.red(`No fleet member named "${name}"`));
 		process.exitCode = 1;
 	}
 }
 
 async function untagHost(args: string[]): Promise<void> {
-	const [hostname, tag] = args;
-	if (!hostname || !tag) {
-		console.error(chalk.red("Usage: prime-agent fleet untag <hostname> <tag>"));
+	const [name, tag] = args;
+	if (!name || !tag) {
+		console.error(chalk.red("Usage: prime-agent fleet untag <name> <tag>"));
 		process.exitCode = 1;
 		return;
 	}
-	const result = await untagHostInFleet(hostname, tag);
-	if (result.success) {
-		console.log(chalk.green(`✓ ${result.message}`));
+	const result = await removeFleetMemberTag(name, tag);
+	if (result) {
+		console.log(chalk.green(`✓ Untagged ${name}: ${tag}`));
 	} else {
-		console.error(chalk.red(result.message));
+		console.error(chalk.red(`No fleet member named "${name}"`));
+		process.exitCode = 1;
+	}
+}
+
+// ─── config ────────────────────────────────────────────────────────
+
+async function configMember(args: string[]): Promise<void> {
+	const [name, key, ...valParts] = args;
+	if (!name) {
+		// Show config for all members
+		await importRuntimeMembers();
+		const members = await listFleetMembers();
+		for (const m of members) {
+			if (m.config && Object.keys(m.config).length > 0) {
+				console.log(chalk.bold(`  ${m.name}:`));
+				for (const [k, v] of Object.entries(m.config)) {
+					console.log(chalk.dim(`    ${k} = ${JSON.stringify(v)}`));
+				}
+			}
+		}
+		return;
+	}
+	if (!key) {
+		// Show config for one member
+		const member = await getFleetMember(name);
+		if (!member) {
+			console.error(chalk.red(`No fleet member named "${name}"`));
+			process.exitCode = 1;
+			return;
+		}
+		console.log(chalk.bold(`  ${member.name} (${member.transport}):`));
+		if (member.config && Object.keys(member.config).length > 0) {
+			for (const [k, v] of Object.entries(member.config)) {
+				console.log(chalk.dim(`    ${k} = ${JSON.stringify(v)}`));
+			}
+		} else {
+			console.log(chalk.dim("    (no config)"));
+		}
+		return;
+	}
+	const value = valParts.join(" ").trim();
+	if (!value) {
+		console.error(chalk.red("Usage: prime-agent fleet config <name> <key> <value>"));
+		process.exitCode = 1;
+		return;
+	}
+	// Try to parse JSON values
+	let parsed: unknown = value;
+	try {
+		parsed = JSON.parse(value);
+	} catch {}
+	const updated = await updateFleetMemberConfig(name, { [key]: parsed });
+	if (updated) {
+		// Also sync to runtime plugin config for backward compat
+		const member = await getFleetMember(name);
+		if (member?.transport && member.transport !== "ssh") {
+			const { savePluginConfig } = await import("./runtime-operations.js");
+			savePluginConfig(member.transport, member.config ?? {});
+		}
+		console.log(chalk.green(`✓ Set ${name}.${key} = ${JSON.stringify(parsed)}`));
+	} else {
+		console.error(chalk.red(`No fleet member named "${name}"`));
 		process.exitCode = 1;
 	}
 }
