@@ -23,7 +23,12 @@ import {
 	visibleWidth,
 } from "@earendil-works/pi-tui";
 import { bootstrapHost, checkHostStatus, disconnectHost } from "../../../cli/fleet/bootstrap.js";
-import { type DiscoveredDevice, discoverDevices, inferTags } from "../../../cli/fleet/discovery.js";
+import {
+	type DiscoveredDevice,
+	discoverDevices,
+	discoverDevicesFast,
+	inferTags,
+} from "../../../cli/fleet/discovery.js";
 import {
 	addFleetHost,
 	type FleetHost,
@@ -93,32 +98,51 @@ export class FleetSelectorComponent extends Container implements Focusable {
 	private async autoDiscover(): Promise<void> {
 		this.setLoading("Discovering networked devices...");
 
+		// Phase 1: instant — Tailscale peers + mDNS (no network scanning)
 		const [fleetHosts, fastDevices] = await Promise.all([
 			listFleetHosts(),
-			discoverDevices({ skipProbe: true }).catch(() => [] as DiscoveredDevice[]),
+			discoverDevicesFast().catch(() => [] as DiscoveredDevice[]),
 		]);
-
-		for (const d of fastDevices) {
-			if (d.tailscaleOnline === true) d.online = true;
-		}
 
 		this.clearLoading();
 		this.entries = mergeHostsAndDevices(fleetHosts, fastDevices);
 		this.applyFilter();
+
+		// Phase 2: background — ARP ping sweep + SSH probing (slower)
 		void this.backgroundProbe();
 	}
 
 	private async backgroundProbe(): Promise<void> {
+		// Full discovery: ping sweep for LAN + SSH probing
 		const probed = await discoverDevices({}).catch(() => null);
 		if (!probed) return;
 
+		// Merge probed results into existing entries
 		for (const probedDevice of probed) {
-			const entry = this.entries.find((e) => e.hostname.toLowerCase() === probedDevice.hostname.toLowerCase());
+			const entry = this.entries.find(
+				(e) =>
+					e.hostname.toLowerCase() === probedDevice.hostname.toLowerCase() || e.address === probedDevice.address,
+			);
 			if (entry) {
 				entry.online = probedDevice.online ?? entry.online;
 				entry.sshable = probedDevice.sshable ?? entry.sshable;
 				entry.hasPi = probedDevice.hasPi ?? entry.hasPi;
 				entry.piVersion = probedDevice.piVersion ?? entry.piVersion;
+			} else {
+				// New device found by ARP that wasn't in fast discovery
+				this.entries.push({
+					hostname: probedDevice.hostname,
+					address: probedDevice.tailscaleIp ?? probedDevice.address,
+					os: probedDevice.os,
+					tags: inferTags(probedDevice),
+					source: "discovered",
+					online: probedDevice.online ?? false,
+					sshable: probedDevice.sshable ?? false,
+					hasPi: probedDevice.hasPi ?? false,
+					piVersion: probedDevice.piVersion,
+					inFleet: false,
+					device: probedDevice,
+				});
 			}
 		}
 

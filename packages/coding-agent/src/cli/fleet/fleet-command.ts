@@ -15,7 +15,7 @@
 
 import chalk from "chalk";
 import { bootstrapHost, checkHostStatus, disconnectHost } from "./bootstrap.js";
-import { discoverDevices, inferTags } from "./discovery.js";
+import { discoverDevices, discoverDevicesFast, inferTags } from "./discovery.js";
 import {
 	addFleetHost,
 	type FleetHost,
@@ -119,7 +119,7 @@ async function discoverFleet(args: string[]): Promise<void> {
 	const fleetNames = new Set(fleetHosts.map((h) => h.hostname.toLowerCase()));
 
 	console.log(chalk.dim("Scanning for networked devices..."));
-	const devices = await discoverDevices({ skipProbe });
+	const devices = skipProbe ? await discoverDevicesFast() : await discoverDevices({});
 
 	// Mark in-fleet devices
 	for (const device of devices) {
