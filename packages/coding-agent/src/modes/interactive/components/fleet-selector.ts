@@ -23,12 +23,7 @@ import {
 	visibleWidth,
 } from "@earendil-works/pi-tui";
 import { bootstrapHost, checkHostStatus, disconnectHost } from "../../../cli/fleet/bootstrap.js";
-import {
-	type DiscoveredDevice,
-	discoverDevices,
-	discoverDevicesFast,
-	inferTags,
-} from "../../../cli/fleet/discovery.js";
+import { type DiscoveredDevice, discoverStream, inferTags } from "../../../cli/fleet/discovery.js";
 import {
 	addFleetHost,
 	type FleetHost,
@@ -93,61 +88,64 @@ export class FleetSelectorComponent extends Container implements Focusable {
 		return this.searchInput;
 	}
 
-	// ─── Auto-discover ────────────────────────────────────────────────
+	// ─── Auto-discover — single streaming pipeline ───────────────────
 
 	private async autoDiscover(): Promise<void> {
 		this.setLoading("Discovering networked devices...");
 
-		// Phase 1: instant — Tailscale peers + mDNS (no network scanning)
-		const [fleetHosts, fastDevices] = await Promise.all([
-			listFleetHosts(),
-			discoverDevicesFast().catch(() => [] as DiscoveredDevice[]),
-		]);
-
+		// Load fleet hosts first — they appear instantly
+		const fleetHosts = await listFleetHosts();
 		this.clearLoading();
-		this.entries = mergeHostsAndDevices(fleetHosts, fastDevices);
+		this.entries = mergeHostsAndDevices(fleetHosts, []);
 		this.applyFilter();
 
-		// Phase 2: background — ARP ping sweep + SSH probing (slower)
-		void this.backgroundProbe();
-	}
-
-	private async backgroundProbe(): Promise<void> {
-		// Full discovery: ping sweep for LAN + SSH probing
-		const probed = await discoverDevices({}).catch(() => null);
-		if (!probed) return;
-
-		// Merge probed results into existing entries
-		for (const probedDevice of probed) {
-			const entry = this.entries.find(
-				(e) =>
-					e.hostname.toLowerCase() === probedDevice.hostname.toLowerCase() || e.address === probedDevice.address,
-			);
-			if (entry) {
-				entry.online = probedDevice.online ?? entry.online;
-				entry.sshable = probedDevice.sshable ?? entry.sshable;
-				entry.hasPi = probedDevice.hasPi ?? entry.hasPi;
-				entry.piVersion = probedDevice.piVersion ?? entry.piVersion;
-			} else {
-				// New device found by ARP that wasn't in fast discovery
-				this.entries.push({
-					hostname: probedDevice.hostname,
-					address: probedDevice.tailscaleIp ?? probedDevice.address,
-					os: probedDevice.os,
-					tags: inferTags(probedDevice),
-					source: "discovered",
-					online: probedDevice.online ?? false,
-					sshable: probedDevice.sshable ?? false,
-					hasPi: probedDevice.hasPi ?? false,
-					piVersion: probedDevice.piVersion,
-					inFleet: false,
-					device: probedDevice,
-				});
+		// Stream devices as they're discovered — no phases, no batches
+		// Each device appears in the TUI the moment it's found
+		try {
+			for await (const device of discoverStream({ probeTimeoutMs: 2000 })) {
+				this.mergeDevice(device);
+				if (this.currentView === "main") {
+					this.applyFilter();
+				}
 			}
+		} catch {
+			// Discovery interrupted — keep what we have
 		}
 
+		this.statusText = `Discovery complete · ${this.entries.length} devices`;
 		if (this.currentView === "main") {
 			this.applyFilter();
+		}
+	}
+
+	private mergeDevice(device: DiscoveredDevice): void {
+		const existing = this.entries.find(
+			(e) => e.hostname.toLowerCase() === device.hostname.toLowerCase() || e.address === device.address,
+		);
+
+		if (existing) {
+			// Enrich existing entry with new info
+			existing.online = device.online || existing.online;
+			existing.sshable = device.sshable ?? existing.sshable;
+			existing.hasPi = device.hasPi ?? existing.hasPi;
+			existing.piVersion = device.piVersion ?? existing.piVersion;
+			if (!existing.os && device.os) existing.os = device.os;
+			existing.tags = [...new Set([...existing.tags, ...inferTags(device)])];
+			existing.device = device;
+		} else {
+			this.entries.push({
+				hostname: device.hostname,
+				address: device.tailscaleIp ?? device.address,
+				os: device.os,
+				tags: inferTags(device),
+				source: "discovered",
+				online: device.online,
+				sshable: device.sshable ?? false,
+				hasPi: device.hasPi ?? false,
+				piVersion: device.piVersion,
+				inFleet: false,
+				device,
+			});
 		}
 	}
 

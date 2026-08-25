@@ -1,13 +1,15 @@
 /**
- * Device discovery — find all devices accessible on the network using live protocols.
+ * Device discovery — unconditional, streaming, pure network.
  *
- * Sources (all network-based, no config file parsing):
- * 1. Tailscale tailnet peers — `tailscale status --json` (live peer list with IPs, OS, online status)
- * 2. mDNS/Bonjour — `dns-sd -B` (discovers services advertising on local network)
- * 3. ARP table + ping sweep — discovers all IPs responding on local subnet
- * 4. SSH probe — `nc -z -w1 <ip> 22` (checks if SSH port is open)
+ * One pipeline:
+ *   addresses → probe → devices
  *
- * No hardcoded hostnames. No config file reading. Pure network discovery.
+ * No conditionals about what tools are installed, what platform we're on,
+ * or what IP ranges to skip. Every source just yields what it can.
+ * Every address gets probed. Anything that responds is a device.
+ *
+ * Results stream in real-time via async generator — the TUI renders
+ * devices as they're discovered, not in batches.
  */
 
 import { exec } from "node:child_process";
@@ -18,316 +20,307 @@ const execAsync = promisify(exec);
 
 export interface DiscoveredDevice {
 	hostname: string;
-	source: "tailscale" | "mdns" | "arp";
 	address: string;
-	tailscaleIp?: string;
+	source: string;
 	os?: string;
-	tailscaleOnline?: boolean;
-	tags: string[];
-	online?: boolean;
+	online: boolean;
 	sshable?: boolean;
 	hasPi?: boolean;
 	piVersion?: string;
+	tailscaleIp?: string;
+	tailscaleOnline?: boolean;
+	tags: string[];
 	inFleet?: boolean;
 }
 
 export interface DiscoveryOptions {
-	/** Skip SSH/pi probing (fast discovery only). */
-	skipProbe?: boolean;
-	/** Probe timeout per host in ms. */
 	probeTimeoutMs?: number;
+	signal?: AbortSignal;
 }
 
 // ─── Public API ─────────────────────────────────────────────────────
 
-export async function discoverDevices(options: DiscoveryOptions = {}): Promise<DiscoveredDevice[]> {
-	const { skipProbe = false, probeTimeoutMs = 3000 } = options;
+/**
+ * Streaming discovery. Yields devices as they're found — real-time.
+ * No phases, no modes. One continuous stream.
+ */
+export async function* discoverStream(options: DiscoveryOptions = {}): AsyncGenerator<DiscoveredDevice> {
+	const { probeTimeoutMs = 2000, signal } = options;
+	const seen = new Set<string>();
 
-	// Phase 1: fast discovery — Tailscale + mDNS (instant, no network scanning)
-	const [tailscaleDevices, mdnsDevices] = await Promise.all([
-		discoverTailscale().catch(() => []),
-		discoverMdns().catch(() => []),
-	]);
+	// Launch all address sources concurrently
+	// Each is an async generator yielding addresses
+	const sources = [fromTailscale(signal), fromRoutingTable(signal), fromNeighborCache(signal), fromMulticast(signal)];
 
-	let devices = mergeDevices([...tailscaleDevices, ...mdnsDevices]);
+	// Merge all sources into one stream, probe each address as it arrives
+	const addressQueue: Promise<{ address: string; source: string; hints?: Partial<DiscoveredDevice> } | null>[] = [];
 
-	// Phase 2: ARP ping sweep — slower, finds local LAN devices
-	const arpDevices = await discoverArp().catch(() => []);
-	devices = mergeDevices([...devices, ...arpDevices]);
-
-	if (!skipProbe) {
-		await probeDevices(devices, probeTimeoutMs);
+	for (const source of sources) {
+		addressQueue.push(
+			(async () => {
+				const result = await source.next();
+				return result.done ? null : result.value;
+			})(),
+		);
 	}
 
-	return devices;
+	// Process addresses as they arrive from any source
+	let activeSources = sources.length;
+	while (activeSources > 0) {
+		if (signal?.aborted) break;
+
+		// Wait for any source to yield an address
+		const result = await Promise.race(addressQueue.map((p, i) => p.then((v) => ({ v, i }))));
+
+		if (result.v === null) {
+			// Source exhausted — restart its slot with next() or mark done
+			const source = sources[result.i];
+			const next = await source.next();
+			if (next.done) {
+				activeSources--;
+				addressQueue[result.i] = Promise.resolve(null);
+			} else {
+				addressQueue[result.i] = Promise.resolve(next.value);
+			}
+			continue;
+		}
+
+		// Got an address — probe it and yield the result
+		const { address, source: src, hints } = result.v;
+		const key = address.toLowerCase();
+
+		if (seen.has(key)) {
+			// Already discovered — restart source slot
+			const source = sources[result.i];
+			const next = await source.next();
+			if (next.done) {
+				activeSources--;
+				addressQueue[result.i] = Promise.resolve(null);
+			} else {
+				addressQueue[result.i] = Promise.resolve(next.value);
+			}
+			continue;
+		}
+
+		seen.add(key);
+
+		// Restart source slot for next iteration
+		const source = sources[result.i];
+		const next = await source.next();
+		if (next.done) {
+			activeSources--;
+			addressQueue[result.i] = Promise.resolve(null);
+		} else {
+			addressQueue[result.i] = Promise.resolve(next.value);
+		}
+
+		// Probe and yield
+		const device = await probeAddress(address, src, hints, probeTimeoutMs, signal);
+		if (device) yield device;
+	}
 }
 
 /**
- * Fast discovery only — Tailscale + mDNS, no ping sweep or SSH probing.
- * Use this for instant results, then call discoverDevices() for full discovery.
+ * Batch discovery — collects all results from the stream.
+ * Convenience wrapper for CLI commands.
  */
-export async function discoverDevicesFast(): Promise<DiscoveredDevice[]> {
-	const [tailscaleDevices, mdnsDevices] = await Promise.all([
-		discoverTailscale().catch(() => []),
-		discoverMdns().catch(() => []),
-	]);
-	return mergeDevices([...tailscaleDevices, ...mdnsDevices]);
+export async function discoverDevices(options: DiscoveryOptions = {}): Promise<DiscoveredDevice[]> {
+	const devices: DiscoveredDevice[] = [];
+	for await (const device of discoverStream(options)) {
+		devices.push(device);
+	}
+	return deduplicate(devices);
+}
+
+/**
+ * Quick discovery — Tailscale + neighbor cache only, no ping sweep.
+ * Probes all addresses in parallel. For when you need results in <2s.
+ */
+export async function discoverDevicesQuick(): Promise<DiscoveredDevice[]> {
+	const addresses: AddressResult[] = [];
+
+	for (const source of [fromTailscale(), fromNeighborCache()]) {
+		for await (const addr of source) {
+			addresses.push(addr);
+		}
+	}
+
+	const probed = await Promise.allSettled(
+		addresses.map((addr) => probeAddress(addr.address, addr.source, addr.hints, 1000)),
+	);
+
+	const devices: DiscoveredDevice[] = [];
+	for (const result of probed) {
+		if (result.status === "fulfilled" && result.value) {
+			devices.push(result.value);
+		}
+	}
+
+	return deduplicate(devices);
 }
 
 export function inferTags(device: DiscoveredDevice): string[] {
-	const tags: string[] = [];
-	if (device.source === "tailscale") tags.push("tailscale");
+	const tags: string[] = [device.source];
 	if (device.os) {
 		const osLower = device.os.toLowerCase();
 		if (osLower.includes("mac") || osLower.includes("darwin")) tags.push("macos", "local");
-		else if (osLower.includes("linux")) tags.push("linux", "cloud");
+		else if (osLower.includes("linux")) tags.push("linux");
 		else if (osLower.includes("android")) tags.push("android");
 		else if (osLower.includes("windows")) tags.push("windows");
 	}
 	return [...new Set(tags)];
 }
 
-// ─── Tailscale — live peer API ──────────────────────────────────────
+// ─── Address sources (all async generators, all unconditional) ──────
 
-async function discoverTailscale(): Promise<DiscoveredDevice[]> {
-	let stdout: string;
+interface AddressResult {
+	address: string;
+	source: string;
+	hints?: Partial<DiscoveredDevice>;
+}
+
+/** Tailscale peers — yields addresses from the Tailscale API */
+async function* fromTailscale(signal?: AbortSignal): AsyncGenerator<AddressResult> {
 	try {
-		stdout = (await execAsync("tailscale status --json", { timeout: 5000 })).stdout;
-	} catch {
-		return [];
-	}
+		const { stdout } = await execAsync("tailscale status --json", { timeout: 5000, signal });
+		const data = JSON.parse(stdout);
 
-	const data = JSON.parse(stdout);
-	const devices: DiscoveredDevice[] = [];
-
-	// Self
-	if (data.Self) {
-		const self = data.Self;
-		const ip = self.TailscaleIPs?.[0];
-		if (ip && self.HostName) {
-			devices.push({
-				hostname: self.HostName,
+		if (data.Self?.TailscaleIPs?.[0] && data.Self?.HostName) {
+			yield {
+				address: data.Self.TailscaleIPs[0],
 				source: "tailscale",
-				address: ip,
-				tailscaleIp: ip,
-				os: self.OS,
-				tailscaleOnline: true,
-				online: true,
-				tags: inferTagsForOs(self.OS, "tailscale"),
-			});
+				hints: {
+					hostname: data.Self.HostName,
+					os: data.Self.OS,
+					online: true,
+					tailscaleIp: data.Self.TailscaleIPs[0],
+					tailscaleOnline: true,
+				},
+			};
 		}
-	}
 
-	// Peers
-	if (data.Peer) {
-		for (const peer of Object.values(data.Peer) as Array<{
-			HostName: string;
-			TailscaleIPs?: string[];
-			Online?: boolean;
-			OS?: string;
-			LastSeen?: string;
-		}>) {
-			const ip = peer.TailscaleIPs?.[0];
-			if (!ip || !peer.HostName) continue;
-			devices.push({
-				hostname: peer.HostName,
-				source: "tailscale",
-				address: ip,
-				tailscaleIp: ip,
-				os: peer.OS,
-				tailscaleOnline: peer.Online ?? false,
-				online: peer.Online ?? false,
-				tags: inferTagsForOs(peer.OS, "tailscale"),
-			});
-		}
-	}
-
-	return devices;
-}
-
-function inferTagsForOs(os: string | undefined, source: string): string[] {
-	const tags = [source];
-	if (os) {
-		const osLower = os.toLowerCase();
-		if (osLower.includes("mac") || osLower.includes("darwin")) tags.push("macos", "local");
-		else if (osLower.includes("linux")) tags.push("linux", "cloud");
-		else if (osLower.includes("android")) tags.push("android");
-	}
-	return tags;
-}
-
-// ─── mDNS/Bonjour — service discovery on local network ──────────────
-
-async function discoverMdns(): Promise<DiscoveredDevice[]> {
-	// dns-sd is macOS-only. On Linux, avahi-browse can be used.
-	const isMac = process.platform === "darwin";
-	if (!isMac) return discoverMdnsLinux();
-
-	// Only browse _ssh._tcp and _workstation._tcp — most relevant for fleet
-	// Other services (afp, smb, airplay) are not useful for SSH-based fleet management
-	const services = ["_ssh._tcp", "_workstation._tcp"];
-
-	const devices: DiscoveredDevice[] = [];
-	const seen = new Set<string>();
-
-	// Browse all services in parallel (each has 1.5s timeout)
-	const results = await Promise.allSettled(
-		services.map((service) =>
-			execAsync(`dns-sd -B ${service} local.`, {
-				timeout: 1500,
-				killSignal: "SIGTERM",
-			}).catch(() => ({ stdout: "", stderr: "" })),
-		),
-	);
-
-	for (const result of results) {
-		if (result.status !== "fulfilled") continue;
-		const output = result.value.stdout + result.value.stderr;
-		for (const line of output.split("\n")) {
-			const parts = line.trim().split(/\s+/);
-			if (parts.length < 7) continue;
-			if (!parts[0]?.match(/^\d+:\d+:\d+/)) continue;
-			const instanceName = parts
-				.slice(6)
-				.join(" ")
-				.replace(/\\[0-9]{3}/g, (m) => String.fromCharCode(Number.parseInt(m.slice(1), 8)));
-			if (!instanceName || instanceName === "STARTING") continue;
-			if (seen.has(instanceName.toLowerCase())) continue;
-			seen.add(instanceName.toLowerCase());
-
-			const hostname = instanceName.replace(/\.local\.?$/, "");
-			devices.push({
-				hostname,
-				source: "mdns",
-				address: `${hostname}.local`,
-				tags: ["local", "mdns"],
-				online: true,
-			});
-		}
-	}
-
-	return devices;
-}
-
-async function discoverMdnsLinux(): Promise<DiscoveredDevice[]> {
-	try {
-		const result = await execAsync("avahi-browse -rtp _ssh._tcp", {
-			timeout: 3000,
-			killSignal: "SIGTERM",
-		}).catch(() => ({ stdout: "" }));
-
-		const devices: DiscoveredDevice[] = [];
-		for (const line of result.stdout.split("\n")) {
-			// avahi-browse -p output: =;eth0;IPv4;hostname;_ssh._tcp;local;hostname.local;192.168.x.x;22;
-			const parts = line.split(";");
-			if (parts.length < 9 || parts[0] !== "=") continue;
-			const hostname = parts[3].replace(/\.local\.?$/, "");
-			const address = parts[7];
-			if (!hostname || !address) continue;
-			devices.push({
-				hostname,
-				source: "mdns",
-				address,
-				tags: ["local", "mdns"],
-				online: true,
-			});
-		}
-		return devices;
-	} catch {
-		return [];
-	}
-}
-
-// ─── Routing table + ARP — all reachable IPs on ALL connected networks ─
-
-/**
- * Read the routing table to find ALL directly-connected networks.
- * This catches local LAN (en0), VPN interfaces (utun0, wg0, tailscale0),
- * Docker bridges (docker0), and any other interface the kernel knows about.
- *
- * Pure network — no config files, no platform-specific APIs.
- */
-async function getConnectedSubnets(): Promise<{ subnet: string; cidr: number; interface: string }[]> {
-	// macOS: netstat -rn
-	// Linux: ip route
-	const isMac = process.platform === "darwin";
-	const subnets: { subnet: string; cidr: number; interface: string }[] = [];
-
-	try {
-		if (isMac) {
-			const { stdout } = await execAsync("netstat -rn -f inet", { timeout: 3000 });
-			for (const line of stdout.split("\n")) {
-				// macOS netstat format:
-				// "192.168.100        link#11            UCS                   en0"  ← network route (3 octets)
-				// "192.168.100.1      f8:28:c9:..        UHLWIir               en0"  ← host route (4 octets)
-				// "100.64/10           link#21            UCS                 utun0"  ← CIDR route
-				const parts = line.trim().split(/\s+/);
-				if (parts.length < 4) continue;
-				const dest = parts[0];
-				const iface = parts[parts.length - 1];
-
-				// Skip default routes, link-local
-				if (dest === "default" || dest.startsWith("169.254")) continue;
-
-				let ip: string;
-				let cidr: number;
-
-				if (dest.includes("/")) {
-					const [ipPart, cidrPart] = dest.split("/");
-					ip = ipPart;
-					cidr = Number.parseInt(cidrPart, 10);
-				} else {
-					// No CIDR — on macOS, network routes show 3 octets (e.g. "192.168.100")
-					// Host routes show 4 octets (e.g. "192.168.100.1") — skip those
-					const octets = dest.split(".");
-					if (octets.length === 3) {
-						// Network route like "192.168.100" → /24
-						ip = `${dest}.0`;
-						cidr = 24;
-					} else if (octets.length === 4) {
-						// Host route — skip (individual host, not a network)
-						continue;
-					} else {
-						continue;
-					}
-				}
-
-				// Skip very large ranges (too slow to sweep)
-				if (cidr < 22) continue;
-				// Skip loopback
-				if (ip.startsWith("127.")) continue;
-				// Skip Tailscale 100.x — handled by Tailscale API
-				if (ip.startsWith("100.")) continue;
-				// Skip multicast
-				if (ip.startsWith("224.") || ip.startsWith("239.")) continue;
-
-				subnets.push({ subnet: ip, cidr, interface: iface });
-			}
-		} else {
-			// Linux: ip route
-			const { stdout } = await execAsync("ip -4 route show", { timeout: 3000 });
-			for (const line of stdout.split("\n")) {
-				// Format: "192.168.100.0/24 dev en0 proto kernel scope link src 192.168.100.81"
-				const match = line.match(/^(\d+\.\d+\.\d+\.\d+)\/(\d+).*dev\s+(\S+)/);
-				if (!match) continue;
-				const [, ip, cidrStr, iface] = match;
-				const cidr = Number.parseInt(cidrStr, 10);
-				if (cidr < 22) continue;
-				if (ip.startsWith("127.") || ip.startsWith("169.254")) continue;
-				if (ip.startsWith("100.")) continue;
-				subnets.push({ subnet: ip, cidr, interface: iface });
+		if (data.Peer) {
+			for (const peer of Object.values(data.Peer) as Array<{
+				HostName: string;
+				TailscaleIPs?: string[];
+				Online?: boolean;
+				OS?: string;
+			}>) {
+				if (signal?.aborted) return;
+				const ip = peer.TailscaleIPs?.[0];
+				if (!ip || !peer.HostName) continue;
+				yield {
+					address: ip,
+					source: "tailscale",
+					hints: {
+						hostname: peer.HostName,
+						os: peer.OS,
+						online: peer.Online ?? false,
+						tailscaleIp: ip,
+						tailscaleOnline: peer.Online ?? false,
+					},
+				};
 			}
 		}
 	} catch {
-		// Fallback: use networkInterfaces()
-		const interfaces = networkInterfaces();
-		for (const [name, addrs] of Object.entries(interfaces)) {
+		// Tailscale not installed or not running — empty stream
+	}
+}
+
+/** Routing table → subnets → ping sweep → yields responding IPs */
+async function* fromRoutingTable(signal?: AbortSignal): AsyncGenerator<AddressResult> {
+	try {
+		const subnets = await readRoutingTable();
+
+		// Ping sweep all subnets in parallel
+		const respondingIps = await pingSweepSubnets(subnets, signal);
+
+		for (const ip of respondingIps) {
+			if (signal?.aborted) return;
+			yield { address: ip, source: "lan" };
+		}
+	} catch {
+		// Can't read routing table — empty stream
+	}
+}
+
+/** Neighbor cache (ARP + NDP) — yields already-known addresses */
+async function* fromNeighborCache(signal?: AbortSignal): AsyncGenerator<AddressResult> {
+	try {
+		const { stdout } = await execAsync("arp -a", { timeout: 3000, signal });
+		for (const line of stdout.split("\n")) {
+			if (signal?.aborted) return;
+			const ipMatch = line.match(/(\d+\.\d+\.\d+\.\d+)/);
+			const macMatch = line.match(/([0-9a-fA-F]{2}[:-]){5}[0-9a-fA-F]{2}/);
+			if (!ipMatch || !macMatch) continue;
+			if (line.includes("incomplete")) continue;
+			if (line.includes("permanent")) continue; // self
+			yield { address: ipMatch[1], source: "lan", hints: { online: true } };
+		}
+	} catch {
+		// Can't read ARP — empty stream
+	}
+
+	// NDP (IPv6 neighbor discovery)
+	try {
+		const { stdout } = await execAsync("ndp -an", { timeout: 3000, signal });
+		for (const line of stdout.split("\n")) {
+			if (signal?.aborted) return;
+			// NDP format: "Neighbor MAC Address Interface"
+			const ipMatch = line.match(/([0-9a-fA-F:]{2,})%/) || line.match(/^([0-9a-fA-F:]+)/);
+			if (!ipMatch) continue;
+			yield { address: ipMatch[1], source: "lan", hints: { online: true } };
+		}
+	} catch {
+		// NDP not available or needs sudo — skip
+	}
+}
+
+/** Multicast discovery — mDNS, SSDP/UPnP, NetBIOS */
+async function* fromMulticast(signal?: AbortSignal): AsyncGenerator<AddressResult> {
+	// mDNS — dns-sd on macOS, avahi on Linux
+	const mdnsDevices = await discoverMdns(signal).catch(() => []);
+	for (const device of mdnsDevices) {
+		if (signal?.aborted) return;
+		yield device;
+	}
+
+	// SSDP/UPnP — find routers, IoT devices, smart TVs
+	const ssdpDevices = await discoverSsdp(signal).catch(() => []);
+	for (const device of ssdpDevices) {
+		if (signal?.aborted) return;
+		yield device;
+	}
+}
+
+// ─── Routing table reader ───────────────────────────────────────────
+
+async function readRoutingTable(): Promise<{ subnet: string; cidr: number }[]> {
+	const subnets: { subnet: string; cidr: number }[] = [];
+
+	// Try macOS netstat first, then Linux ip route, then fallback to interfaces
+	const commands = ["netstat -rn -f inet", "ip -4 route show"];
+
+	for (const cmd of commands) {
+		try {
+			const { stdout } = await execAsync(cmd, { timeout: 3000 });
+			for (const line of stdout.split("\n")) {
+				const parsed = parseRouteLine(line, cmd.includes("netstat"));
+				if (parsed) subnets.push(parsed);
+			}
+			if (subnets.length > 0) break; // First command that works wins
+		} catch {}
+	}
+
+	// Fallback: derive subnets from network interfaces
+	if (subnets.length === 0) {
+		for (const addrs of Object.values(networkInterfaces())) {
 			if (!addrs) continue;
 			for (const addr of addrs) {
 				if (addr.family === "IPv4" && !addr.internal) {
 					const parts = addr.address.split(".");
 					if (parts.length === 4) {
-						subnets.push({ subnet: `${parts[0]}.${parts[1]}.${parts[2]}.0`, cidr: 24, interface: name });
+						subnets.push({ subnet: `${parts[0]}.${parts[1]}.${parts[2]}.0`, cidr: 24 });
 					}
 				}
 			}
@@ -344,226 +337,298 @@ async function getConnectedSubnets(): Promise<{ subnet: string; cidr: number; in
 	});
 }
 
-async function discoverArp(): Promise<DiscoveredDevice[]> {
-	const subnets = await getConnectedSubnets();
-	if (subnets.length === 0) return [];
+function parseRouteLine(line: string, isMac: boolean): { subnet: string; cidr: number } | null {
+	if (isMac) {
+		// macOS: "192.168.100        link#11            UCS                   en0"
+		const parts = line.trim().split(/\s+/);
+		if (parts.length < 4) return null;
+		const dest = parts[0];
+		if (dest === "default" || dest.startsWith("169.254")) return null;
 
-	// Ping sweep all subnets in parallel to populate ARP table
-	await pingSweep(subnets);
+		if (dest.includes("/")) {
+			const [ip, cidrStr] = dest.split("/");
+			const cidr = Number.parseInt(cidrStr, 10);
+			if (cidr < 22 || ip.startsWith("127.") || ip.startsWith("224.") || ip.startsWith("239.")) return null;
+			return { subnet: ip, cidr };
+		}
 
-	// Read ARP table — all IPs that responded
-	const arpDevices = await readArpTable();
-	return arpDevices;
+		// 3-octet network route → /24
+		const octets = dest.split(".");
+		if (octets.length === 3) {
+			const ip = `${dest}.0`;
+			if (ip.startsWith("127.") || ip.startsWith("224.") || ip.startsWith("239.")) return null;
+			return { subnet: ip, cidr: 24 };
+		}
+		return null;
+	}
+
+	// Linux: "192.168.100.0/24 dev en0 proto kernel scope link src 192.168.100.81"
+	const match = line.match(/^(\d+\.\d+\.\d+\.\d+)\/(\d+)/);
+	if (!match) return null;
+	const [, ip, cidrStr] = match;
+	const cidr = Number.parseInt(cidrStr, 10);
+	if (
+		cidr < 22 ||
+		ip.startsWith("127.") ||
+		ip.startsWith("169.254") ||
+		ip.startsWith("224.") ||
+		ip.startsWith("239.")
+	) {
+		return null;
+	}
+	return { subnet: ip, cidr };
 }
 
-async function pingSweep(subnets: { subnet: string; cidr: number }[]): Promise<void> {
-	const pings: Promise<void>[] = [];
+// ─── Ping sweep ─────────────────────────────────────────────────────
 
+async function pingSweepSubnets(subnets: { subnet: string; cidr: number }[], signal?: AbortSignal): Promise<string[]> {
+	const allIps: string[] = [];
 	for (const { subnet, cidr } of subnets) {
-		const hosts = getHostsInSubnet(subnet, cidr);
-		for (const ip of hosts) {
-			pings.push(
-				execAsync(`ping -c1 -W1 -t1 ${ip} 2>/dev/null || true`, { timeout: 2000 }).then(
-					() => {},
-					() => {},
-				),
-			);
+		allIps.push(...getHostsInSubnet(subnet, cidr));
+	}
+
+	// Ping all IPs in parallel, collect responders
+	const pingBatch = 200; // concurrency limit
+	const responders: string[] = [];
+
+	for (let i = 0; i < allIps.length; i += pingBatch) {
+		if (signal?.aborted) break;
+		const batch = allIps.slice(i, i + pingBatch);
+		const results = await Promise.allSettled(
+			batch.map((ip) =>
+				execAsync(`ping -c1 -W1 -t1 ${ip} 2>/dev/null && echo OK || true`, { timeout: 2000 })
+					.then(({ stdout }) => (stdout.includes("OK") ? ip : null))
+					.catch(() => null),
+			),
+		);
+		for (const result of results) {
+			if (result.status === "fulfilled" && result.value) {
+				responders.push(result.value);
+			}
 		}
 	}
 
-	await Promise.allSettled(pings);
+	return responders;
 }
 
-/**
- * Generate all host IPs in a subnet (excluding network and broadcast).
- * Only supports /24 to /30 (smaller subnets — larger ones skipped earlier).
- */
 function getHostsInSubnet(subnet: string, cidr: number): string[] {
 	const parts = subnet.split(".").map(Number);
 	if (parts.length !== 4) return [];
 
-	if (cidr === 24) {
-		const hosts: string[] = [];
-		for (let i = 1; i <= 254; i++) hosts.push(`${parts[0]}.${parts[1]}.${parts[2]}.${i}`);
-		return hosts;
+	const maxHosts = Math.min(254, 2 ** (32 - cidr) - 2);
+	const hosts: string[] = [];
+	for (let i = 1; i <= maxHosts; i++) {
+		hosts.push(`${parts[0]}.${parts[1]}.${parts[2]}.${i}`);
 	}
-	if (cidr === 25) {
-		const base = parts[3] & 0xfe;
-		return [`${parts[0]}.${parts[1]}.${parts[2]}.${base + 1}`, `${parts[0]}.${parts[1]}.${parts[2]}.${base + 2}`];
-	}
-	if (cidr === 26) {
-		const base = parts[3] & 0xfc;
-		const hosts: string[] = [];
-		for (let i = 1; i <= 62; i++) hosts.push(`${parts[0]}.${parts[1]}.${parts[2]}.${base + i}`);
-		return hosts;
-	}
-	if (cidr === 27) {
-		const base = parts[3] & 0xf8;
-		const hosts: string[] = [];
-		for (let i = 1; i <= 30; i++) hosts.push(`${parts[0]}.${parts[1]}.${parts[2]}.${base + i}`);
-		return hosts;
-	}
-	if (cidr === 28) {
-		const base = parts[3] & 0xf0;
-		const hosts: string[] = [];
-		for (let i = 1; i <= 14; i++) hosts.push(`${parts[0]}.${parts[1]}.${parts[2]}.${base + i}`);
-		return hosts;
-	}
-	if (cidr === 30) {
-		const base = parts[3] & 0xfc;
-		return [`${parts[0]}.${parts[1]}.${parts[2]}.${base + 1}`, `${parts[0]}.${parts[1]}.${parts[2]}.${base + 2}`];
-	}
-	// /22 or larger — cap at 512 hosts
-	if (cidr <= 22) {
-		const hosts: string[] = [];
-		for (let i = 1; i <= 512 && i <= 1022; i++) hosts.push(`${parts[0]}.${parts[1]}.${parts[2]}.${i}`);
-		return hosts;
-	}
-	return [];
+	return hosts;
 }
 
-async function readArpTable(): Promise<DiscoveredDevice[]> {
-	try {
-		const { stdout } = await execAsync("arp -a", { timeout: 3000 });
-		const devices: DiscoveredDevice[] = [];
+// ─── mDNS ───────────────────────────────────────────────────────────
 
-		for (const line of stdout.split("\n")) {
-			// macOS: "? (192.168.100.1) at f8:28:c9:7:96:94 on en0 ifscope [ethernet]"
-			// Linux: "192.168.100.1 ether f8:28:c9:7:96:94 C en0"
-			const macMatch = line.match(
-				/([0-9a-fA-F]{2}[:-][0-9a-fA-F]{2}[:-][0-9a-fA-F]{2}[:-][0-9a-fA-F]{2}[:-][0-9a-fA-F]{2}[:-][0-9a-fA-F]{2})/,
-			);
-			const ipMatch = line.match(/(\d+\.\d+\.\d+\.\d+)/);
+async function discoverMdns(signal?: AbortSignal): Promise<AddressResult[]> {
+	const services = ["_ssh._tcp", "_workstation._tcp"];
+	const devices: AddressResult[] = [];
+	const seen = new Set<string>();
 
-			if (!macMatch || !ipMatch) continue;
-			const mac = macMatch[1];
-			const ip = ipMatch[1];
+	// Try dns-sd (macOS) and avahi (Linux) in parallel
+	const [macResult, linuxResult] = await Promise.allSettled([
+		discoverMdnsMac(services, signal),
+		discoverMdnsLinux(signal),
+	]);
 
-			// Skip incomplete MACs (device didn't respond)
-			if (mac.includes("incomplete") || mac === "0:0:0:0:0:0") continue;
-
-			// Skip multicast/broadcast addresses
-			if (ip.startsWith("224.") || ip.startsWith("239.") || ip === "255.255.255.255") continue;
-
-			// Skip self (local interfaces have "permanent" flag on macOS)
-			if (line.includes("permanent")) continue;
-
-			// Generate hostname from MAC — try reverse DNS first, fall back to IP
-			let hostname = ip;
-			try {
-				const { stdout: dnsResult } = await execAsync(`dig +short -x ${ip} 2>/dev/null || true`, {
-					timeout: 1000,
-				});
-				const dnsName = dnsResult.trim().replace(/\.$/, "");
-				if (dnsName && !dnsName.includes("in-addr")) {
-					hostname = dnsName.replace(/\.local\.?$/, "");
-				}
-			} catch {
-				// Use IP as hostname
+	if (macResult.status === "fulfilled") {
+		for (const d of macResult.value) {
+			const key = d.address.toLowerCase();
+			if (!seen.has(key)) {
+				seen.add(key);
+				devices.push(d);
 			}
+		}
+	}
+	if (linuxResult.status === "fulfilled") {
+		for (const d of linuxResult.value) {
+			const key = d.address.toLowerCase();
+			if (!seen.has(key)) {
+				seen.add(key);
+				devices.push(d);
+			}
+		}
+	}
 
+	return devices;
+}
+
+async function discoverMdnsMac(services: string[], signal?: AbortSignal): Promise<AddressResult[]> {
+	const devices: AddressResult[] = [];
+	const seen = new Set<string>();
+
+	const results = await Promise.allSettled(
+		services.map((service) =>
+			execAsync(`dns-sd -B ${service} local.`, {
+				timeout: 1500,
+				killSignal: "SIGTERM",
+				signal,
+			}).catch(() => ({ stdout: "", stderr: "" })),
+		),
+	);
+
+	for (const result of results) {
+		if (result.status !== "fulfilled") continue;
+		const output = result.value.stdout + result.value.stderr;
+		for (const line of output.split("\n")) {
+			const parts = line.trim().split(/\s+/);
+			if (parts.length < 7 || !parts[0]?.match(/^\d+:\d+:\d+/)) continue;
+			const instanceName = parts
+				.slice(6)
+				.join(" ")
+				.replace(/\\[0-9]{3}/g, (m) => String.fromCharCode(Number.parseInt(m.slice(1), 8)));
+			if (!instanceName || instanceName === "STARTING") continue;
+			if (seen.has(instanceName.toLowerCase())) continue;
+			seen.add(instanceName.toLowerCase());
+			const hostname = instanceName.replace(/\.local\.?$/, "");
 			devices.push({
-				hostname,
-				source: "arp",
-				address: ip,
-				tags: ["local", "lan"],
-				online: true, // In ARP table = responded to ARP = online
+				address: `${hostname}.local`,
+				source: "mdns",
+				hints: { hostname, online: true },
 			});
 		}
+	}
 
+	return devices;
+}
+
+async function discoverMdnsLinux(signal?: AbortSignal): Promise<AddressResult[]> {
+	try {
+		const result = await execAsync("avahi-browse -rtp _ssh._tcp", {
+			timeout: 3000,
+			killSignal: "SIGTERM",
+			signal,
+		});
+		const devices: AddressResult[] = [];
+		for (const line of result.stdout.split("\n")) {
+			const parts = line.split(";");
+			if (parts.length < 9 || parts[0] !== "=") continue;
+			const hostname = parts[3].replace(/\.local\.?$/, "");
+			const address = parts[7];
+			if (hostname && address) {
+				devices.push({ address, source: "mdns", hints: { hostname, online: true } });
+			}
+		}
 		return devices;
 	} catch {
 		return [];
 	}
 }
 
-// ─── Merge & deduplicate ────────────────────────────────────────────
+// ─── SSDP/UPnP ──────────────────────────────────────────────────────
 
-function mergeDevices(devices: DiscoveredDevice[]): DiscoveredDevice[] {
-	// Use a single map keyed by hostname, with IP-based cross-referencing
-	const byHostname = new Map<string, DiscoveredDevice>();
-	const hostnameByIp = new Map<string, string>(); // ip -> hostname key
+async function discoverSsdp(signal?: AbortSignal): Promise<AddressResult[]> {
+	// SSDP uses UDP multicast to 239.255.255.250:1900
+	// Works on any OS with raw UDP sockets — no tool dependency
+	return new Promise((resolve) => {
+		try {
+			const dgram = require("node:dgram") as typeof import("node:dgram");
+			const sock = dgram.createSocket("udp4");
+			const devices: AddressResult[] = [];
+			const seen = new Set<string>();
 
-	const priority: Record<string, number> = { tailscale: 3, mdns: 2, arp: 1 };
-	const sorted = [...devices].sort((a, b) => (priority[b.source] ?? 0) - (priority[a.source] ?? 0));
+			sock.on("message", (msg, rinfo) => {
+				const ip = rinfo.address;
+				if (seen.has(ip)) return;
+				seen.add(ip);
+				const text = msg.toString("utf-8");
+				// Extract SERVER or LOCATION header for device info
+				let hostname = ip;
+				for (const line of text.split("\r\n")) {
+					const locMatch = line.match(/LOCATION:\s*http:\/\/([^:/]+)/i);
+					if (locMatch) {
+						hostname = locMatch[1];
+						break;
+					}
+				}
+				devices.push({ address: ip, source: "upnp", hints: { hostname, online: true } });
+			});
 
-	for (const device of sorted) {
-		const hostnameKey = device.hostname.toLowerCase();
-		const ipKey = device.address;
+			sock.on("error", () => {
+				resolve([]);
+			});
 
-		// Find existing by hostname or by IP cross-reference
-		const existingByHostname = byHostname.get(hostnameKey);
-		const existingHostnameByIp = hostnameByIp.get(ipKey);
-		const existingByIp = existingHostnameByIp ? byHostname.get(existingHostnameByIp) : undefined;
-		const existing = existingByHostname ?? existingByIp;
+			sock.bind(0, () => {
+				const msg = Buffer.from(
+					'M-SEARCH * HTTP/1.1\r\nHOST: 239.255.255.250:1900\r\nMAN: "ssdp:discover"\r\nMX: 2\r\nST: ssdp:all\r\n\r\n',
+				);
+				sock.setBroadcast(true);
+				sock.send(msg, 1900, "239.255.255.250");
 
-		if (!existing) {
-			const entry = { ...device };
-			byHostname.set(hostnameKey, entry);
-			if (ipKey && ipKey !== hostnameKey) {
-				hostnameByIp.set(ipKey, hostnameKey);
+				// Collect responses for 2 seconds
+				setTimeout(() => {
+					sock.close();
+					resolve(devices);
+				}, 2000);
+			});
+
+			if (signal) {
+				signal.addEventListener("abort", () => {
+					sock.close();
+					resolve(devices);
+				});
 			}
-			continue;
+		} catch {
+			resolve([]);
 		}
-
-		// Merge — higher priority source wins, enrich with lower priority info
-		if (priority[device.source] > priority[existing.source]) {
-			const replacement = {
-				...device,
-				tags: [...new Set([...device.tags, ...existing.tags])],
-				online: device.online ?? existing.online,
-				os: device.os ?? existing.os,
-			};
-			byHostname.set(hostnameKey, replacement);
-			if (ipKey && ipKey !== hostnameKey) {
-				hostnameByIp.set(ipKey, hostnameKey);
-			}
-		} else {
-			existing.tags = [...new Set([...existing.tags, ...device.tags])];
-			if (!existing.os && device.os) existing.os = device.os;
-			if (existing.online === undefined && device.online !== undefined) {
-				existing.online = device.online;
-			}
-			// Cross-reference IP if we don't have it
-			if (ipKey && !hostnameByIp.has(ipKey)) {
-				hostnameByIp.set(ipKey, hostnameKey);
-			}
-		}
-	}
-
-	return Array.from(byHostname.values());
+	});
 }
 
-// ─── Probing — SSH + pi detection ───────────────────────────────────
+// ─── Probing ────────────────────────────────────────────────────────
 
-async function probeDevices(devices: DiscoveredDevice[], timeoutMs: number): Promise<void> {
-	const probeConcurrency = 10;
-	const chunks: DiscoveredDevice[][] = [];
-	for (let i = 0; i < devices.length; i += probeConcurrency) {
-		chunks.push(devices.slice(i, i + probeConcurrency));
+async function probeAddress(
+	address: string,
+	source: string,
+	hints?: Partial<DiscoveredDevice>,
+	timeoutMs = 2000,
+	signal?: AbortSignal,
+): Promise<DiscoveredDevice | null> {
+	// Resolve hostname — try reverse DNS, fall back to address
+	let hostname = hints?.hostname ?? address;
+	if (hostname === address) {
+		try {
+			const { stdout } = await execAsync(`dig +short -x ${address} 2>/dev/null || true`, {
+				timeout: 1000,
+				signal,
+			});
+			const dnsName = stdout
+				.trim()
+				.replace(/\.$/, "")
+				.replace(/\.local\.?$/, "");
+			if (dnsName && !dnsName.includes("in-addr")) hostname = dnsName;
+		} catch {
+			// use address as hostname
+		}
 	}
 
-	for (const chunk of chunks) {
-		await Promise.allSettled(chunk.map((d) => probeSingleDevice(d, timeoutMs)));
-	}
-}
+	const device: DiscoveredDevice = {
+		hostname,
+		address,
+		source,
+		online: hints?.online ?? false,
+		os: hints?.os,
+		tailscaleIp: hints?.tailscaleIp,
+		tailscaleOnline: hints?.tailscaleOnline,
+		tags: hints?.tags ?? [source],
+	};
 
-async function probeSingleDevice(device: DiscoveredDevice, timeoutMs: number): Promise<void> {
-	const address = device.tailscaleIp ?? device.address;
-	if (!address) return;
-
-	// Quick TCP connect to port 22 (SSH)
-	const sshOpen = await probePort(address, 22, Math.min(timeoutMs, 2000));
+	// TCP probe port 22 (SSH)
+	const sshOpen = await probePort(address, 22, Math.min(timeoutMs, 1500));
 	device.sshable = sshOpen;
-	if (sshOpen && device.online === undefined) device.online = true;
+	if (sshOpen) device.online = true;
 
-	// If SSH is open, try to detect pi
+	// If SSH is open, check for pi/prime-agent
 	if (sshOpen) {
 		try {
-			const sshTarget = device.hostname.includes(".") ? address : device.hostname;
+			const sshTarget = hostname.includes(".") ? address : hostname;
 			const { stdout } = await execAsync(
 				`ssh -o ConnectTimeout=2 -o StrictHostKeyChecking=no -o BatchMode=yes ${sshTarget} "command -v pi && pi --version 2>/dev/null || command -v prime-agent && prime-agent --version 2>/dev/null || echo NOT_FOUND" 2>/dev/null`,
-				{ timeout: timeoutMs },
+				{ timeout: timeoutMs, signal },
 			).catch(() => ({ stdout: "NOT_FOUND" }));
 
 			if (!stdout.includes("NOT_FOUND")) {
@@ -572,9 +637,17 @@ async function probeSingleDevice(device: DiscoveredDevice, timeoutMs: number): P
 				if (versionMatch) device.piVersion = versionMatch[1];
 			}
 		} catch {
-			// SSH auth failed — still sshable (port is open), just can't check pi
+			// SSH auth failed — still sshable
 		}
 	}
+
+	// If we got no online signal from any source, do a quick ping
+	if (!device.online && !hints?.online) {
+		const pingOk = await pingAddress(address, 1000);
+		device.online = pingOk;
+	}
+
+	return device;
 }
 
 function probePort(host: string, port: number, timeoutMs: number): Promise<boolean> {
@@ -588,4 +661,61 @@ function probePort(host: string, port: number, timeoutMs: number): Promise<boole
 			.then(({ stdout }) => resolve(stdout.includes("OK")))
 			.catch(() => resolve(false));
 	});
+}
+
+function pingAddress(host: string, timeoutMs: number): Promise<boolean> {
+	return new Promise((resolve) => {
+		execAsync(`ping -c1 -W1 -t1 ${host} 2>/dev/null && echo OK || echo FAIL`, {
+			timeout: timeoutMs + 1000,
+		})
+			.then(({ stdout }) => resolve(stdout.includes("OK")))
+			.catch(() => resolve(false));
+	});
+}
+
+// ─── Deduplication ──────────────────────────────────────────────────
+
+function deduplicate(devices: DiscoveredDevice[]): DiscoveredDevice[] {
+	const byHostname = new Map<string, DiscoveredDevice>();
+	const hostnameByIp = new Map<string, string>();
+
+	const priority: Record<string, number> = { tailscale: 3, mdns: 2, upnp: 2, lan: 1 };
+	const sorted = [...devices].sort((a, b) => (priority[b.source] ?? 0) - (priority[a.source] ?? 0));
+
+	for (const device of sorted) {
+		const hostnameKey = device.hostname.toLowerCase();
+		const ipKey = device.address;
+
+		const existingByHostname = byHostname.get(hostnameKey);
+		const existingByIp = hostnameByIp.get(ipKey) ? byHostname.get(hostnameByIp.get(ipKey)!) : undefined;
+		const existing = existingByHostname ?? existingByIp;
+
+		if (!existing) {
+			byHostname.set(hostnameKey, { ...device });
+			if (ipKey && ipKey !== hostnameKey) hostnameByIp.set(ipKey, hostnameKey);
+			continue;
+		}
+
+		// Merge — higher priority source wins
+		if ((priority[device.source] ?? 0) > (priority[existing.source] ?? 0)) {
+			byHostname.set(hostnameKey, {
+				...device,
+				tags: [...new Set([...device.tags, ...existing.tags])],
+				online: device.online || existing.online,
+				os: device.os ?? existing.os,
+				sshable: device.sshable ?? existing.sshable,
+				hasPi: device.hasPi ?? existing.hasPi,
+				piVersion: device.piVersion ?? existing.piVersion,
+			});
+		} else {
+			existing.tags = [...new Set([...existing.tags, ...device.tags])];
+			if (!existing.os && device.os) existing.os = device.os;
+			if (!existing.sshable && device.sshable) existing.sshable = device.sshable;
+			if (!existing.hasPi && device.hasPi) existing.hasPi = device.hasPi;
+			if (!existing.piVersion && device.piVersion) existing.piVersion = device.piVersion;
+			if (!existing.online && device.online) existing.online = true;
+		}
+	}
+
+	return Array.from(byHostname.values());
 }
