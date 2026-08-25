@@ -1,8 +1,7 @@
 /**
  * Standalone TUI launcher for `prime-agent fleet` (interactive mode).
  *
- * Creates a TUI with a FleetSelectorComponent, similar to how `pi config`
- * creates a TUI with ConfigSelectorComponent.
+ * Creates a TUI with a FleetSelectorComponent.
  */
 
 import { ProcessTerminal, TUI } from "@earendil-works/pi-tui";
@@ -18,8 +17,8 @@ export async function selectFleetInteractive(): Promise<void> {
 		const ui = new TUI(new ProcessTerminal());
 		let resolved = false;
 
-		const selector = new FleetSelectorComponent(
-			() => {
+		const selector = new FleetSelectorComponent({
+			onDone: () => {
 				if (!resolved) {
 					resolved = true;
 					ui.stop();
@@ -27,13 +26,13 @@ export async function selectFleetInteractive(): Promise<void> {
 					resolve();
 				}
 			},
-			() => {
+			onCancel: () => {
 				ui.stop();
 				stopThemeWatcher();
 				process.exit(0);
 			},
-			() => ui.requestRender(),
-		);
+			requestRender: () => ui.requestRender(),
+		});
 
 		ui.addChild(selector);
 		ui.setFocus(selector);

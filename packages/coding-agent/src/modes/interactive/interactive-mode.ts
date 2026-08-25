@@ -9716,6 +9716,14 @@ export class InteractiveMode {
 		const { handleFleetCommand } = await import("../../cli/fleet/index.js");
 		const fleetArgs = args ? args.trim().split(/\s+/) : [];
 
+		// If no subcommand args → show the fleet selector as a modal overlay
+		// (same UX as /model). Subcommands like "list", "add", etc. still
+		// run as text output in the chat.
+		if (fleetArgs.length === 0) {
+			this.showFleetSelectorOverlay();
+			return;
+		}
+
 		// Capture stdout to render in the chat
 		const lines: string[] = [];
 		const origLog = console.log;
@@ -9744,6 +9752,29 @@ export class InteractiveMode {
 		this.chatContainer.addChild(new Markdown(`\`\`\`\n${output}\n\`\`\``, 1, 1, this.getMarkdownThemeWithSettings()));
 		this.chatContainer.addChild(new DynamicBorder());
 		this.ui.requestRender();
+	}
+
+	private showFleetSelectorOverlay(): void {
+		const { FleetSelectorComponent } =
+			require("./components/fleet-selector.js") as typeof import("./components/fleet-selector.js");
+
+		let handle: OverlayHandle | undefined;
+		let settled = false;
+
+		const finish = () => {
+			if (settled) return;
+			settled = true;
+			handle?.hide();
+			this.ui.requestRender();
+		};
+
+		const selector = new FleetSelectorComponent({
+			onDone: finish,
+			onCancel: finish,
+			requestRender: () => this.ui.requestRender(),
+		});
+
+		handle = this.showFullPaneOverlay(selector, 96);
 	}
 
 	private capitalizeKey(key: string): string {
