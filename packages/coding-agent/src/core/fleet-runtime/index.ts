@@ -53,4 +53,11 @@ export {
 export { type FleetRlmChild, type FleetRlmSpawnParams, spawnFleetChild } from "./fleet-rlm-spawn.js";
 export { GitHubActionsRuntime, type GitHubActionsRuntimeConfig } from "./github-actions-runtime.js";
 export { LocalRuntime, type LocalSpawnHandlers } from "./local-runtime.js";
+export {
+	buildRuntimeRegistry,
+	type LoadedPlugin,
+	loadRuntimePlugins,
+	type PluginContext,
+	runtimesDir,
+} from "./runtime-plugin-loader.js";
 export { SSHRuntime } from "./ssh-runtime.js";
