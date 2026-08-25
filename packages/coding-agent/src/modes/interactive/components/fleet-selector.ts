@@ -18,6 +18,7 @@ import {
 	fuzzyFilter,
 	getKeybindings,
 	Input,
+	matchesKey,
 	Spacer,
 	Text,
 	truncateToWidth,
@@ -546,7 +547,7 @@ export class FleetSelectorComponent extends Container implements Focusable {
 		}
 
 		// Ctrl+R — quick rename selected device (if in fleet)
-		if (data === "\x12" && this.searchInput.getValue() === "") {
+		if (matchesKey(data, "ctrl+r") && this.searchInput.getValue() === "") {
 			const entry = this.filteredEntries[this.cursorIndex];
 			if (entry && entry.inFleet) {
 				this.searchInput.setValue("");
@@ -562,7 +563,7 @@ export class FleetSelectorComponent extends Container implements Focusable {
 		}
 
 		// Ctrl+T — quick tag selected device (if in fleet)
-		if (data === "\x14" && this.searchInput.getValue() === "") {
+		if (matchesKey(data, "ctrl+t") && this.searchInput.getValue() === "") {
 			const entry = this.filteredEntries[this.cursorIndex];
 			if (entry && entry.inFleet) {
 				this.searchInput.setValue("");
