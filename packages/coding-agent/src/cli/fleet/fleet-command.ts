@@ -121,36 +121,61 @@ export async function handleFleetCommand(args: string[]): Promise<void> {
 async function listFleet(args: string[]): Promise<void> {
 	const json = args.includes("--json");
 	const hosts = await listFleetHosts();
+	const plugins = await listRuntimePlugins();
+	const activeRuntimes = plugins.filter((p) => p.active);
 
 	if (json) {
-		console.log(JSON.stringify({ hosts }, null, 2));
+		console.log(JSON.stringify({ hosts, runtimes: activeRuntimes }, null, 2));
 		return;
 	}
 
-	if (hosts.length === 0) {
-		console.log(chalk.dim("No hosts in fleet. Run `prime-agent fleet discover` to find devices."));
+	if (hosts.length === 0 && activeRuntimes.length === 0) {
+		console.log(chalk.dim("No hosts or runtimes. Run `prime-agent fleet discover` to find devices."));
+		console.log(chalk.dim("Install runtime adapters with `prime-agent fleet runtimes install <name>`"));
 		return;
 	}
 
-	console.log(chalk.bold("\n  Fleet Hosts\n"));
-	console.log(
-		`  ${"NAME".padEnd(20)} ${"HOSTNAME".padEnd(20)} ${"ADDRESS".padEnd(20)} ${"TAGS".padEnd(20)} ${"STATUS".padEnd(12)} ${"PI"}`,
-	);
-	console.log(
-		`  ${"─".repeat(20)} ${"─".repeat(20)} ${"─".repeat(20)} ${"─".repeat(20)} ${"─".repeat(12)} ${"─".repeat(10)}`,
-	);
-
-	for (const host of hosts) {
-		const status = host.lastStatus ?? "unknown";
-		const statusColor = status === "connected" ? chalk.green : status === "disconnected" ? chalk.yellow : chalk.dim;
-		const tags = host.tags.join(",") || "-";
-		const name = host.displayName ?? host.hostname;
-		const nameCol = host.displayName ? chalk.cyan(name) : name;
+	if (hosts.length > 0) {
+		console.log(chalk.bold("\n  Fleet Hosts (SSH-accessible machines)\n"));
 		console.log(
-			`  ${nameCol.padEnd(20)} ${host.hostname.padEnd(20)} ${host.address.padEnd(20)} ${tags.padEnd(20)} ${statusColor(status.padEnd(12))} ${host.piVersion ?? "-"}`,
+			`  ${"NAME".padEnd(20)} ${"HOSTNAME".padEnd(20)} ${"ADDRESS".padEnd(20)} ${"TAGS".padEnd(20)} ${"STATUS".padEnd(12)} ${"PI"}`,
 		);
+		console.log(
+			`  ${"─".repeat(20)} ${"─".repeat(20)} ${"─".repeat(20)} ${"─".repeat(20)} ${"─".repeat(12)} ${"─".repeat(10)}`,
+		);
+
+		for (const host of hosts) {
+			const status = host.lastStatus ?? "unknown";
+			const statusColor =
+				status === "connected" ? chalk.green : status === "disconnected" ? chalk.yellow : chalk.dim;
+			const tags = host.tags.join(",") || "-";
+			const name = host.displayName ?? host.hostname;
+			const nameCol = host.displayName ? chalk.cyan(name) : name;
+			console.log(
+				`  ${nameCol.padEnd(20)} ${host.hostname.padEnd(20)} ${host.address.padEnd(20)} ${tags.padEnd(20)} ${statusColor(status.padEnd(12))} ${host.piVersion ?? "-"}`,
+			);
+		}
+		console.log();
 	}
-	console.log();
+
+	if (activeRuntimes.length > 0) {
+		console.log(chalk.bold("  Runtime Adapters (cloud + custom platforms)\n"));
+		console.log(`  ${"NAME".padEnd(18)} ${"PLATFORM".padEnd(16)} ${"SOURCE".padEnd(10)} ${"CONFIG"}`);
+		console.log(`  ${"─".repeat(18)} ${"─".repeat(16)} ${"─".repeat(10)} ${"─".repeat(10)}`);
+		for (const rt of activeRuntimes) {
+			const name = rt.source === "builtin" ? chalk.cyan(rt.name) : chalk.green(rt.name);
+			const config = rt.hasConfig ? chalk.green("✓") : "-";
+			console.log(`  ${name.padEnd(18)} ${rt.platform.padEnd(16)} ${rt.source.padEnd(10)} ${config}`);
+		}
+		console.log();
+		console.log(
+			chalk.dim(
+				"  Use host='ssh' or host='<fleet-hostname>' for SSH, host='cloudflare' for CF Workers, host='github' for GH Actions",
+			),
+		);
+		console.log(chalk.dim("  Manage: prime-agent fleet runtimes list | install | setup | config | enable | disable"));
+		console.log();
+	}
 }
 
 // ─── discover ──────────────────────────────────────────────────────
