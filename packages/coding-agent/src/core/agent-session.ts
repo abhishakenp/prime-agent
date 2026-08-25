@@ -1,7 +1,7 @@
 import { AsyncLocalStorage } from "node:async_hooks";
 import { randomUUID } from "node:crypto";
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
-import { tmpdir } from "node:os";
+import { hostname as osHostname, tmpdir } from "node:os";
 import { basename, dirname, join, resolve } from "node:path";
 import {
 	Agent,
@@ -302,6 +302,8 @@ export interface RlmChildAgentSnapshot {
 	activity?: RlmChildAgentActivity;
 	repliedSinceTask?: boolean;
 	error?: string;
+	/** Fleet host where this child runs (for distributed agents). */
+	host?: string;
 }
 
 export type CompactionReason = "manual" | "threshold" | "overflow" | "requested";
@@ -1156,6 +1158,8 @@ export class AgentSession {
 	private _repliedToParentSinceTask: boolean | undefined;
 	private _parentReplyCount = 0;
 	private _subagentRuntimeHost?: SubagentRuntimeHost;
+	/** Fleet identity for this agent — used for distributed spawning. */
+	private _fleetIdentity: import("./fleet-runtime/agent-identity.js").AgentIdentityRecord | undefined;
 	private _activeRlmChildRuns = new Map<string, RlmChildRun>();
 	private _unsettledRlmChildRuns = new Set<RlmChildRun>();
 	private _abandonedRlmQuiescenceChildIds = new Set<string>();
@@ -1268,6 +1272,20 @@ export class AgentSession {
 		this._rlmSessionDir = config.rlmSessionDir;
 		this._rlmParentNodeId = config.rlmParentNodeId;
 		this._rlmParentAgent = config.rlmParentAgent;
+		// Initialize fleet identity for distributed spawning
+		this._fleetIdentity = {
+			agentId: this._rlmParentNodeId ?? randomUUID(),
+			host: osHostname(),
+			hardwareId: `${process.arch}-${process.platform}`,
+			sessionDir: this._rlmSessionDir ?? this._cwd,
+			model: this.model ? `${this.model.provider}/${this.model.id}` : "default",
+			label: this._rlmDepth === 0 ? "orchestrator" : `child-depth-${this._rlmDepth}`,
+			depth: this._rlmDepth,
+			parentAgentId: this._rlmParentNodeId,
+			parentHost: undefined,
+			startedAt: Date.now(),
+			tags: [],
+		};
 		// A resumed child may have replied before this process started; false would
 		// claim knowledge that is not present in the session transcript.
 		this._repliedToParentSinceTask =
@@ -10253,10 +10271,15 @@ export class AgentSession {
 		kwargs: Record<string, unknown> = {},
 		spawnCode?: string,
 	): Promise<RlmSpawnHandle> {
-		const { name: rawName, model: rawModel, thinking: rawThinking, ...unsupported } = kwargs;
+		const { name: rawName, model: rawModel, thinking: rawThinking, host: rawHost, ...unsupported } = kwargs;
 		const unsupportedKwargs = Object.keys(unsupported);
 		if (unsupportedKwargs.length > 0) {
 			throw new Error(`Unsupported rlm.run kwargs: ${unsupportedKwargs.sort().join(", ")}`);
+		}
+
+		// Fleet-aware spawn: if host= is specified, route through the fleet runtime
+		if (rawHost && rawHost !== "local" && rawHost !== "self") {
+			return this._startFleetRlmChild(prompt, kwargs);
 		}
 		const requestedSessionName = normalizeRequestedRlmSubagentSessionName(rawName);
 		const requestedModel = normalizeRequestedRlmSubagentModel(rawModel);
@@ -10645,6 +10668,166 @@ export class AgentSession {
 			name: sessionName,
 			session_dir: childSessionDir,
 			model: `${modelSelection.model.provider}/${modelSelection.model.id}`,
+		};
+	}
+
+	/**
+	 * Fleet-aware RLM child spawn — routes to a remote host via the fleet runtime.
+	 *
+	 * When rlm("task", host="a2") is called, this method:
+	 * 1. Resolves the runtime adapter for the target host
+	 * 2. Spawns the agent on the remote host
+	 * 3. Creates an RlmSpawnHandle that tracks the remote agent
+	 * 4. Events from the remote agent flow back through the status endpoint
+	 * 5. The child appears in the RLM child registry like any local child
+	 */
+	private async _startFleetRlmChild(prompt: string, kwargs: Record<string, unknown>): Promise<RlmSpawnHandle> {
+		const { RuntimeRegistry, SSHRuntime, LocalRuntime } = await import("./fleet-runtime/index.js");
+
+		// Build the runtime registry with SSH + local adapters
+		const registry = new RuntimeRegistry();
+		registry.register(
+			new LocalRuntime({
+				spawnLocal: (p, k) => this.runRlmChild(p, k),
+				subscribeToLocal: (_childId, _listener) => () => {},
+				abortLocal: async (_childId) => {},
+			}),
+		);
+		registry.register(new SSHRuntime());
+
+		const { spawnFleetChild } = await import("./fleet-runtime/fleet-rlm-spawn.js");
+
+		const parentIdentity = this._fleetIdentity;
+		const result = await spawnFleetChild(registry, prompt, kwargs, parentIdentity);
+		if (!result) {
+			// No host specified — fall back to local spawn
+			return this._startRlmChildRun(prompt, { ...kwargs, host: undefined });
+		}
+
+		const { identity, statusEndpoint } = result;
+		const childNodeId = identity.agentId;
+		const sessionName = identity.label;
+		const childSessionDir = identity.sessionDir;
+
+		// Create an RlmChildRun to track this remote agent
+		const _startedAt = Date.now();
+		let answerPreview: string | undefined;
+		let durationMs: number | undefined;
+		let toolUseCount = 0;
+		let activity: RlmChildAgentActivity | undefined;
+
+		const run: RlmChildRun = {
+			id: childNodeId,
+			prompt,
+			sessionName,
+			sessionDir: childSessionDir,
+			model: { provider: "fleet", id: identity.model } as any,
+			status: "queued",
+			settled: false,
+			abort: noopRlmChildAbort,
+			publication: createAgentMessageDeferred(),
+			settlement: createAgentMessageDeferred(),
+			deletionReservation: createAgentMessageDeferred(),
+		};
+
+		const _throwIfCancelled = () => {
+			if (run.status === "cancelled") throw new Error(run.error ?? "RLM child cancelled");
+		};
+
+		this._activeRlmChildRuns.set(run.id, run);
+		this._unsettledRlmChildRuns.add(run);
+
+		const emitChildUpdate = () => {
+			this._emit({
+				type: "rlm_child_update",
+				child: {
+					id: childNodeId,
+					parentId: this._rlmParentNodeId,
+					sessionName,
+					model: identity.model,
+					label: rlmChildLabel(prompt),
+					status: run.status,
+					durationMs,
+					answerPreview,
+					toolUseCount: toolUseCount > 0 ? toolUseCount : undefined,
+					tokenCount: undefined,
+					recap: undefined,
+					sessionDir: childSessionDir,
+					activity,
+					repliedSinceTask: false,
+					error: run.error,
+					host: identity.host,
+				},
+			});
+		};
+		run.emitUpdate = emitChildUpdate;
+		emitChildUpdate();
+
+		// Subscribe to events from the remote agent
+		if (statusEndpoint.subscribe) {
+			statusEndpoint.subscribe((event) => {
+				switch (event.type) {
+					case "status": {
+						run.status = event.status === "completed" ? "done" : event.status === "error" ? "error" : "running";
+						durationMs = event.info.durationMs;
+						answerPreview = event.info.answerPreview;
+						toolUseCount = event.info.toolUseCount ?? 0;
+						if (run.status === "done" || run.status === "error") {
+							run.settled = true;
+							this._unsettledRlmChildRuns.delete(run);
+							run.settlement.resolve();
+						}
+						emitChildUpdate();
+						break;
+					}
+					case "message": {
+						if (event.role === "assistant" && !answerPreview) {
+							answerPreview = event.content.slice(0, 200);
+						}
+						emitChildUpdate();
+						break;
+					}
+					case "log": {
+						if (event.level === "error") {
+							this._emit({
+								type: "rlm_child_update",
+								child: {
+									id: childNodeId,
+									parentId: this._rlmParentNodeId,
+									sessionName,
+									model: identity.model,
+									label: rlmChildLabel(prompt),
+									status: run.status,
+									sessionDir: childSessionDir,
+									error: `[fleet:${identity.host}] ${event.message}`,
+								},
+							});
+						}
+						break;
+					}
+				}
+			});
+		}
+
+		// Wire up abort
+		if (statusEndpoint.abort) {
+			run.abort = async () => {
+				await statusEndpoint.abort!();
+				run.status = "cancelled";
+				run.error = "Aborted by parent";
+				emitChildUpdate();
+			};
+		}
+
+		// Mark as running
+		run.status = "running";
+		emitChildUpdate();
+
+		return {
+			rlm_child_id: childNodeId,
+			name: sessionName,
+			session_dir: childSessionDir,
+			model: identity.model,
 		};
 	}
 

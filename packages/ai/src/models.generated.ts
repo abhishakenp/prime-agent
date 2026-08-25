@@ -9573,7 +9573,7 @@ export const MODELS = {
 			cost: {
 				input: 2,
 				output: 6,
-				cacheRead: 0.5,
+				cacheRead: 0.3,
 				cacheWrite: 0,
 			},
 			contextWindow: 500000,
@@ -10014,9 +10014,9 @@ export const MODELS = {
 			contextWindow: 1050000,
 			maxTokens: 128000,
 		} satisfies Model<"openai-responses">,
-		"grok-4.5": {
-			id: "grok-4.5",
-			name: "Grok 4.5",
+		"grok-4.6": {
+			id: "grok-4.6",
+			name: "Grok 4.6",
 			api: "openai-responses",
 			provider: "opencode-go",
 			baseUrl: "https://opencode.ai/zen/go/v1",
@@ -11140,13 +11140,13 @@ export const MODELS = {
 			thinkingLevelMap: {"minimal":null,"low":null,"medium":null,"high":"high","xhigh":"max","max":null},
 			input: ["text"],
 			cost: {
-				input: 0.061599999999999995,
-				output: 0.12319999999999999,
-				cacheRead: 0.012320000000000001,
+				input: 0.04,
+				output: 0.08,
+				cacheRead: 0.008,
 				cacheWrite: 0,
 			},
 			contextWindow: 1310720,
-			maxTokens: 131072,
+			maxTokens: 943718,
 		} satisfies Model<"openai-completions">,
 		"deepseek/deepseek-v4-flash-vision-exp": {
 			id: "deepseek/deepseek-v4-flash-vision-exp",
@@ -12003,7 +12003,7 @@ export const MODELS = {
 				cacheWrite: 0,
 			},
 			contextWindow: 204800,
-			maxTokens: 176947,
+			maxTokens: 131072,
 		} satisfies Model<"openai-completions">,
 		"minimax/minimax-m2.7:free": {
 			id: "minimax/minimax-m2.7:free",
@@ -14585,10 +14585,10 @@ export const MODELS = {
 			thinkingLevelMap: {"minimal":null,"low":"low","medium":"medium","high":null,"xhigh":"xhigh","max":null},
 			input: ["text", "image"],
 			cost: {
-				input: 0.425,
+				input: 0.39999999999999997,
 				output: 2.5500000000000003,
-				cacheRead: 0.08499999999999999,
-				cacheWrite: 0.53125,
+				cacheRead: 0.049999999999999996,
+				cacheWrite: 0,
 			},
 			contextWindow: 1000000,
 			maxTokens: 131072,
@@ -15915,7 +15915,7 @@ export const MODELS = {
 				cacheWrite: 0,
 			},
 			contextWindow: 1310720,
-			maxTokens: 131072,
+			maxTokens: 943718,
 		} satisfies Model<"openai-completions">,
 		"deepseek/deepseek-v4-pro": {
 			id: "deepseek/deepseek-v4-pro",
@@ -16196,7 +16196,7 @@ export const MODELS = {
 				cacheWrite: 0,
 			},
 			contextWindow: 204800,
-			maxTokens: 176947,
+			maxTokens: 131072,
 		} satisfies Model<"openai-completions">,
 		"minimax/minimax-m3": {
 			id: "minimax/minimax-m3",
