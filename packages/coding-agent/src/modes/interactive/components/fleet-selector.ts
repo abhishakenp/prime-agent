@@ -77,12 +77,14 @@ export class FleetSelectorComponent extends Container implements Focusable {
 			void this.handleBatchConfirm(items);
 		};
 		this.multiSelect.onCancel = () => this.handleCancel();
+		this.isLoading = true;
+		this.statusText = "Discovering networked devices...";
 		this.addChild(new DynamicBorder());
 		this.addChild(new Text(theme.bold(theme.fg("accent", "Fleet Manager")), 1, 0));
 		this.addChild(new Spacer(1));
 		this.addChild(this.multiSelect);
 		this.addChild(new Spacer(1));
-		this.addChild(new Text("", 1, 0));
+		this.addChild(new Text(theme.fg("dim", this.statusText), 1, 0));
 		this.addChild(new DynamicBorder());
 		void this.autoDiscover();
 	}
@@ -95,13 +97,46 @@ export class FleetSelectorComponent extends Container implements Focusable {
 
 	private async autoDiscover(): Promise<void> {
 		this.setLoading("Discovering networked devices...");
-		const [fleetHosts, devices] = await Promise.all([
+
+		// Phase 1: fast discovery (no probing) — instant results
+		const [fleetHosts, fastDevices] = await Promise.all([
 			listFleetHosts(),
-			discoverDevices({}).catch(() => [] as DiscoveredDevice[]),
+			discoverDevices({ skipProbe: true }).catch(() => [] as DiscoveredDevice[]),
 		]);
+
+		// Mark Tailscale-online devices as online immediately
+		for (const d of fastDevices) {
+			if (d.tailscaleOnline === true) d.online = true;
+		}
+
 		this.clearLoading();
-		this.entries = mergeHostsAndDevices(fleetHosts, devices);
+		this.entries = mergeHostsAndDevices(fleetHosts, fastDevices);
 		this.showMainView();
+
+		// Phase 2: probe in background for SSH/pi status (slower)
+		// Only probe online-looking devices, update UI as results come in
+		void this.backgroundProbe(fleetHosts);
+	}
+
+	private async backgroundProbe(_fleetHosts: FleetHost[]): Promise<void> {
+		const probed = await discoverDevices({}).catch(() => null);
+		if (!probed) return;
+
+		// Merge probe results into existing entries
+		for (const probedDevice of probed) {
+			const entry = this.entries.find((e) => e.hostname.toLowerCase() === probedDevice.hostname.toLowerCase());
+			if (entry) {
+				entry.online = probedDevice.online ?? entry.online;
+				entry.sshable = probedDevice.sshable ?? entry.sshable;
+				entry.hasPi = probedDevice.hasPi ?? entry.hasPi;
+				entry.piVersion = probedDevice.piVersion ?? entry.piVersion;
+			}
+		}
+
+		// Re-render with updated info (only if still on main view)
+		if (this.currentView === "main") {
+			this.showMainView();
+		}
 	}
 
 	// ─── Views ────────────────────────────────────────────────────────
