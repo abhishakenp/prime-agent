@@ -1,0 +1,64 @@
+name: Prime Agent ${{ github.run_id }}
+on:
+  workflow_dispatch:
+    inputs:
+      agent_id:
+        description: 'Agent ID'
+        required: true
+        default: 'f7dbf113-41c6-4163-b021-705af729d315'
+
+jobs:
+  agent:
+    runs-on: ubuntu-latest
+    env:
+      AGENT_ID: ${{ github.event.inputs.agent_id }}
+      DEEPSEEK_API_KEY: ${{ secrets.DEEPSEEK_API_KEY }}
+      OLLAMA_API_KEY: ${{ secrets.OLLAMA_API_KEY }}
+      OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
+      FIRECRAWL_API_KEY: ${{ secrets.FIRECRAWL_API_KEY }}
+      CLAUDE_CODE_OAUTH_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+      OPENCODE_API_KEY: ${{ secrets.OPENCODE_API_KEY }}
+      GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+      MIMO_API_KEY: ${{ secrets.MIMO_API_KEY }}
+      HF_TOKEN: ${{ secrets.HF_TOKEN }}
+      DASHSCOPE_API_KEY: ${{ secrets.DASHSCOPE_API_KEY }}
+    steps:
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: Download and Extract Agent Bundle
+        run: |
+          curl -sL "https://gist.githubusercontent.com/abhishakenp/2239f1e8ac12923e468c085dd0aa7eb0/raw/3386316254dbf2f934fa0787a0be9059a98b9864/bundle-f7dbf113.tar.gz.b64" -o /tmp/bundle.b64
+          base64 -d /tmp/bundle.b64 > /tmp/bundle.tar.gz
+          mkdir -p /tmp/agent-bundle
+          tar xzf /tmp/bundle.tar.gz -C /tmp/agent-bundle
+          BUNDLE_DIR=$(ls /tmp/agent-bundle)
+          echo "BUNDLE_DIR=/tmp/agent-bundle/$BUNDLE_DIR" >> $GITHUB_ENV
+          mkdir -p $BUNDLE_DIR/agent
+          node -e "const fs=require('fs');const keys=["DEEPSEEK_API_KEY","OLLAMA_API_KEY","OPENROUTER_API_KEY","FIRECRAWL_API_KEY","CLAUDE_CODE_OAUTH_TOKEN","OPENCODE_API_KEY","GEMINI_API_KEY","MIMO_API_KEY","HF_TOKEN","DASHSCOPE_API_KEY"];const env={};for(const k of keys){env[k]=process.env[k]||'';}fs.writeFileSync('$BUNDLE_DIR/agent/env.json',JSON.stringify(env,null,2));"
+
+      - name: Run Agent
+        run: |
+          bash $BUNDLE_DIR/run.sh
+        env:
+          AGENT_ID: f7dbf113-41c6-4163-b021-705af729d315
+          DEEPSEEK_API_KEY: ${{ secrets.DEEPSEEK_API_KEY }}
+          OLLAMA_API_KEY: ${{ secrets.OLLAMA_API_KEY }}
+          OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
+          FIRECRAWL_API_KEY: ${{ secrets.FIRECRAWL_API_KEY }}
+          CLAUDE_CODE_OAUTH_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          OPENCODE_API_KEY: ${{ secrets.OPENCODE_API_KEY }}
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          MIMO_API_KEY: ${{ secrets.MIMO_API_KEY }}
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+          DASHSCOPE_API_KEY: ${{ secrets.DASHSCOPE_API_KEY }}
+
+      - name: Upload Results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: agent-results-${{ github.run_id }}
+          path: |
+            /tmp/agent-bundle/
