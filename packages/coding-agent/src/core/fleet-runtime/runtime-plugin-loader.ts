@@ -1,36 +1,29 @@
 /**
- * Runtime plugin loader — discovers and loads runtime adapters from ~/.prime/runtimes/.
+ * Runtime plugin loader — discovers and loads runtime adapters as plugins.
  *
  * Runtimes are plugins. LocalRuntime is always built-in (default).
- * All other runtimes (SSH, Cloudflare, GitHub Actions, custom) are loaded from:
+ * All other runtimes (SSH, Cloudflare, GitHub Actions, custom) are plugins
+ * loaded from two directories:
  *
- *   ~/.prime/runtimes/*.mjs   (or .js, .cjs)
+ *   1. <installDir>/dist/plugins/runtimes/  ← built-in plugins (self-contained .mjs)
+ *   2. ~/.prime/runtimes/                   ← user plugins (override built-ins)
  *
- * Each plugin module exports one of:
- *   - default class implementing AgentRuntime
- *   - named export `runtime` — an AgentRuntime instance
- *   - named export `createRuntime` — (ctx: PluginContext) => AgentRuntime | Promise<AgentRuntime>
+ * User plugins take precedence: if a user plugin has the same platform name
+ * as a built-in plugin, the user's version wins.
  *
- * A companion `*.json` file (same basename) can provide config:
+ * Each plugin is a self-contained ESM module (.mjs) that exports:
+ *
+ *   export function createRuntime({ config }) {
+ *     return new MyRuntime(config);  // or a custom AgentRuntime impl
+ *   }
+ *
+ * A companion `*.json` file (same basename) can provide config + enable/disable:
  *
  *   ~/.prime/runtimes/my-runtime.mjs       ← plugin code
- *   ~/.prime/runtimes/my-runtime.json      ← optional config
+ *   ~/.prime/runtimes/my-runtime.json      ← optional: { "config": {...}, "enabled": true }
  *
- * Config JSON format:
- *   { "config": { ... }, "enabled": true }
- *
- * PluginContext (passed to createRuntime):
- *   - config: the config object from the companion JSON
- *   - primeAgentDir: path to the prime-agent installation (for importing built-ins)
- *
- * Plugin resolution order:
- *   1. Built-in LocalRuntime (always registered first)
- *   2. Plugins from ~/.prime/runtimes/ (sorted by filename)
- *   3. Built-in fallbacks (SSH, Cloudflare, GitHub Actions) if no plugin
- *      registered for that platform yet
- *
- * This lets users override built-ins by placing a plugin with the same
- * platform name in ~/.prime/runtimes/.
+ * Plugins are fully self-contained — no imports from prime-agent internals.
+ * Built-in plugins are bundled via esbuild (scripts/bundle-runtimes.mjs).
  *
  * Example custom plugin (~/.prime/runtimes/my-runtime.mjs):
  *
@@ -44,15 +37,6 @@
  *       }
  *     };
  *   }
- *
- * Example overriding a built-in with custom config:
- *
- *   export async function createRuntime({ config, primeAgentDir }) {
- *     const { SSHRuntime } = await import(
- *       join(primeAgentDir, "dist/core/fleet-runtime/ssh-runtime.js")
- *     );
- *     return new SSHRuntime(config);
- *   }
  */
 
 import { existsSync, readdirSync, readFileSync, statSync } from "node:fs";
@@ -62,25 +46,21 @@ import { fileURLToPath } from "node:url";
 import type { AgentRuntime } from "./agent-runtime.js";
 import { RuntimeRegistry } from "./agent-runtime.js";
 
-/** Directory where runtime plugins live. */
-export function runtimesDir(): string {
+/** User plugin directory: ~/.prime/runtimes/ */
+export function userRuntimesDir(): string {
 	return join(homedir(), ".prime", "runtimes");
 }
 
-/** Resolve the prime-agent installation directory (for plugin imports). */
-function resolvePrimeAgentDir(): string {
-	// This file is at: <primeAgentDir>/dist/core/fleet-runtime/runtime-plugin-loader.js
-	// Go up 4 levels: dist/core/fleet-runtime -> dist/core -> dist -> <primeAgentDir>
+/** Built-in plugin directory: <installDir>/dist/plugins/runtimes/ */
+export function builtinRuntimesDir(): string {
+	// This file is at: <installDir>/dist/core/fleet-runtime/runtime-plugin-loader.js
+	// Built-in plugins are at: <installDir>/dist/plugins/runtimes/
 	try {
 		const thisFile = fileURLToPath(import.meta.url);
-		return dirname(dirname(dirname(dirname(thisFile))));
+		const installDir = dirname(dirname(dirname(dirname(thisFile))));
+		return join(installDir, "dist", "plugins", "runtimes");
 	} catch {
-		// Fallback: try common locations
-		const candidates = [join(homedir(), ".prime", "agent"), "/usr/local/lib/prime-agent", "/opt/prime-agent"];
-		for (const c of candidates) {
-			if (existsSync(join(c, "dist", "cli.js"))) return c;
-		}
-		return join(homedir(), ".prime", "agent");
+		return join(homedir(), ".prime", "agent", "dist", "plugins", "runtimes");
 	}
 }
 
@@ -88,8 +68,6 @@ function resolvePrimeAgentDir(): string {
 export interface PluginContext {
 	/** Config from the companion JSON file. */
 	config: Record<string, unknown>;
-	/** Path to the prime-agent installation (for importing built-ins). */
-	primeAgentDir: string;
 }
 
 /** A loaded runtime plugin. */
@@ -102,8 +80,8 @@ export interface LoadedPlugin {
 	runtime: AgentRuntime;
 	/** Source path. */
 	path: string;
-	/** Whether it was enabled. */
-	enabled: boolean;
+	/** Whether it was a user plugin (vs built-in). */
+	isUserPlugin: boolean;
 }
 
 /** Plugin module exports — at least one must be present. */
@@ -126,7 +104,7 @@ function readPluginConfig(pluginPath: string): { config?: Record<string, unknown
 	}
 }
 
-/** Discover plugin files in ~/.prime/runtimes/. */
+/** Discover plugin files in a directory. */
 function discoverPluginFiles(dir: string): string[] {
 	if (!existsSync(dir)) return [];
 	try {
@@ -143,28 +121,44 @@ function discoverPluginFiles(dir: string): string[] {
 }
 
 /** Load a single plugin module. */
-async function loadPlugin(pluginPath: string, primeAgentDir: string): Promise<AgentRuntime | null> {
+async function loadPlugin(pluginPath: string, isUserPlugin: boolean): Promise<LoadedPlugin | null> {
 	try {
 		const mod = (await import(pluginPath)) as PluginExports;
 		const { config, enabled } = readPluginConfig(pluginPath);
 
 		if (enabled === false) return null;
 
-		const ctx: PluginContext = { config: config ?? {}, primeAgentDir };
+		const ctx: PluginContext = { config: config ?? {} };
 
-		// Three supported export patterns
+		let runtime: AgentRuntime | null = null;
+
 		if (mod.createRuntime) {
-			return await mod.createRuntime(ctx);
-		}
-		if (mod.runtime) {
-			return mod.runtime;
-		}
-		if (mod.default) {
-			return new mod.default(config);
+			runtime = await mod.createRuntime(ctx);
+		} else if (mod.runtime) {
+			runtime = mod.runtime;
+		} else if (mod.default) {
+			runtime = new mod.default(config);
+		} else {
+			console.warn(`[fleet-runtime] Plugin ${pluginPath} has no valid export (createRuntime, runtime, or default)`);
+			return null;
 		}
 
-		console.warn(`[fleet-runtime] Plugin ${pluginPath} has no valid export (default, runtime, or createRuntime)`);
-		return null;
+		if (!runtime || !runtime.platform) {
+			console.warn(`[fleet-runtime] Plugin ${pluginPath} returned invalid runtime (missing platform)`);
+			return null;
+		}
+
+		return {
+			name:
+				pluginPath
+					.split("/")
+					.pop()
+					?.replace(/\.(mjs|js|cjs)$/, "") ?? "unknown",
+			platform: runtime.platform,
+			runtime,
+			path: pluginPath,
+			isUserPlugin,
+		};
 	} catch (err) {
 		console.warn(`[fleet-runtime] Failed to load plugin ${pluginPath}:`, err);
 		return null;
@@ -172,66 +166,61 @@ async function loadPlugin(pluginPath: string, primeAgentDir: string): Promise<Ag
 }
 
 /**
- * Load all runtime plugins from ~/.prime/runtimes/ and register them.
- * Returns the list of successfully loaded plugins.
+ * Load all runtime plugins.
+ *
+ * Scans:
+ *   1. <installDir>/dist/plugins/runtimes/  (built-in, self-contained)
+ *   2. ~/.prime/runtimes/                   (user plugins — override built-ins)
+ *
+ * User plugins with the same platform name as a built-in replace it.
  */
-export async function loadRuntimePlugins(dir: string = runtimesDir()): Promise<LoadedPlugin[]> {
-	const files = discoverPluginFiles(dir);
-	const plugins: LoadedPlugin[] = [];
-	const primeAgentDir = resolvePrimeAgentDir();
+export async function loadRuntimePlugins(
+	builtinDir: string = builtinRuntimesDir(),
+	userDir: string = userRuntimesDir(),
+): Promise<LoadedPlugin[]> {
+	const platformToPlugin = new Map<string, LoadedPlugin>();
 
-	for (const file of files) {
-		const runtime = await loadPlugin(file, primeAgentDir);
-		if (runtime && runtime.platform) {
-			plugins.push({
-				name:
-					file
-						.split("/")
-						.pop()
-						?.replace(/\.(mjs|js|cjs)$/, "") ?? "unknown",
-				platform: runtime.platform,
-				runtime,
-				path: file,
-				enabled: true,
-			});
+	// 1. Load built-in plugins first
+	for (const file of discoverPluginFiles(builtinDir)) {
+		const plugin = await loadPlugin(file, false);
+		if (plugin) {
+			platformToPlugin.set(plugin.platform, plugin);
 		}
 	}
 
-	return plugins;
+	// 2. Load user plugins — override built-ins with same platform name
+	for (const file of discoverPluginFiles(userDir)) {
+		const plugin = await loadPlugin(file, true);
+		if (plugin) {
+			platformToPlugin.set(plugin.platform, plugin);
+		}
+	}
+
+	return [...platformToPlugin.values()];
 }
 
 /**
  * Build a complete RuntimeRegistry:
- *   1. Register LocalRuntime (caller provides handlers)
- *   2. Load plugins from ~/.prime/runtimes/
- *   3. Register built-in fallbacks for any platform not covered by plugins
+ *   1. Register LocalRuntime (always first — default)
+ *   2. Load built-in plugins from <installDir>/dist/plugins/runtimes/
+ *   3. Load user plugins from ~/.prime/runtimes/ (override built-ins)
  *
- * This is the single entry point used by agent-session.ts.
+ * No hardcoded fallbacks. Everything except LocalRuntime is a plugin.
  */
 export async function buildRuntimeRegistry(
 	localRuntime: AgentRuntime,
-	builtInFallbacks: AgentRuntime[] = [],
-	pluginsDir: string = runtimesDir(),
+	builtinDir: string = builtinRuntimesDir(),
+	userDir: string = userRuntimesDir(),
 ): Promise<{ registry: RuntimeRegistry; plugins: LoadedPlugin[] }> {
 	const registry = new RuntimeRegistry();
 
 	// 1. Local is always first (default)
 	registry.register(localRuntime);
 
-	// 2. Load plugins
-	const plugins = await loadRuntimePlugins(pluginsDir);
-	const pluginPlatforms = new Set<string>();
-
+	// 2. Load all plugins (built-in + user overrides)
+	const plugins = await loadRuntimePlugins(builtinDir, userDir);
 	for (const plugin of plugins) {
 		registry.register(plugin.runtime);
-		pluginPlatforms.add(plugin.platform);
-	}
-
-	// 3. Register built-in fallbacks that aren't overridden by plugins
-	for (const fallback of builtInFallbacks) {
-		if (!pluginPlatforms.has(fallback.platform)) {
-			registry.register(fallback);
-		}
 	}
 
 	return { registry, plugins };

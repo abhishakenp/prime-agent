@@ -10682,19 +10682,18 @@ export class AgentSession {
 	 * 5. The child appears in the RLM child registry like any local child
 	 */
 	private async _startFleetRlmChild(prompt: string, kwargs: Record<string, unknown>): Promise<RlmSpawnHandle> {
-		const { buildRuntimeRegistry, LocalRuntime, SSHRuntime, CloudflareRuntime, GitHubActionsRuntime } = await import(
-			"./fleet-runtime/index.js"
-		);
+		const { buildRuntimeRegistry, LocalRuntime } = await import("./fleet-runtime/index.js");
 
-		// Build runtime registry: LocalRuntime (default) + plugins from ~/.prime/runtimes/ + built-in fallbacks
+		// Build runtime registry: LocalRuntime (default) + plugins (built-in + user)
+		// No hardcoded fallbacks — everything except LocalRuntime is a plugin.
+		// Built-in plugins: <installDir>/dist/plugins/runtimes/*.mjs (self-contained)
+		// User plugins: ~/.prime/runtimes/*.mjs (override built-ins)
 		const { registry } = await buildRuntimeRegistry(
 			new LocalRuntime({
 				spawnLocal: (p, k) => this.runRlmChild(p, k),
 				subscribeToLocal: (_childId, _listener) => () => {},
 				abortLocal: async (_childId) => {},
 			}),
-			// Built-in fallbacks — only registered if no plugin overrides them
-			[new SSHRuntime(), new CloudflareRuntime(), new GitHubActionsRuntime()],
 		);
 
 		const { spawnFleetChild } = await import("./fleet-runtime/fleet-rlm-spawn.js");

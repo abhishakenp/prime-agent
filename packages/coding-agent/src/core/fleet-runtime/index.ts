@@ -55,9 +55,10 @@ export { GitHubActionsRuntime, type GitHubActionsRuntimeConfig } from "./github-
 export { LocalRuntime, type LocalSpawnHandlers } from "./local-runtime.js";
 export {
 	buildRuntimeRegistry,
+	builtinRuntimesDir,
 	type LoadedPlugin,
 	loadRuntimePlugins,
 	type PluginContext,
-	runtimesDir,
+	userRuntimesDir,
 } from "./runtime-plugin-loader.js";
 export { SSHRuntime } from "./ssh-runtime.js";

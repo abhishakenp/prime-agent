@@ -43,7 +43,7 @@
 		"test:process-stress": "vitest --run --tagsFilter process-stress test/daemon-supervisor-process.test.ts",
 		"postinstall": "node postinstall.cjs",
 		"prepublishOnly": "npm run clean && npm run build",
-		"bundle": "node scripts/bundle.mjs",
+		"bundle": "node scripts/bundle.mjs && node scripts/bundle-runtimes.mjs",
 		"test:kernel": "vitest --run --no-file-parallelism --tagsFilter kernel-heavy test/acp-kernel-features.test.ts test/acp-cold-cli.test.ts test/kernel-goal-skill.test.ts test/kernel-state-roundtrip.test.ts test/kernel-mcp-shutdown.test.ts"
 	},
 	"dependencies": {
