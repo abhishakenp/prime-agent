@@ -164,25 +164,27 @@ export class FleetSelectorComponent extends Container implements Focusable {
 			}
 		}
 
-		// Add available runtime templates (not yet added to fleet)
+		// Add available runtime plugins (templates + removed user plugins)
 		const plugins = await listRuntimePlugins();
 		for (const p of plugins) {
-			if (p.source === "template" && !addedTransports.has(p.name)) {
-				this.entries.push({
-					hostname: p.name,
-					address: "not configured",
-					tags: ["available"],
-					source: "discovered",
-					online: false,
-					sshable: false,
-					hasPi: false,
-					inFleet: false,
-					transport: p.name,
-					isCloud: true,
-					isTemplate: true,
-					hasConfig: false,
-				});
-			}
+			if (addedTransports.has(p.name)) continue;
+			// Show templates and user/builtin plugins that aren't in the fleet
+			// (e.g. removed cloud members should still appear as available)
+			this.entries.push({
+				hostname: p.name,
+				address: p.hasConfig ? "configured" : "not configured",
+				tags: ["available"],
+				source: "discovered",
+				online: false,
+				sshable: false,
+				hasPi: false,
+				inFleet: false,
+				transport: p.name,
+				isCloud: true,
+				isTemplate: true,
+				hasConfig: p.hasConfig,
+				config: p.config,
+			});
 		}
 
 		this.applyFilter();
@@ -501,9 +503,15 @@ export class FleetSelectorComponent extends Container implements Focusable {
 		const entry = this.filteredEntries[this.cursorIndex];
 		if (!entry) return;
 
-		// Runtime template → add + auto-setup
+		// Available runtime (template or removed plugin) → add to fleet
 		if (entry.isTemplate) {
-			await this.addAndSetupRuntime(entry);
+			if (entry.hasConfig) {
+				// Was configured before (removed plugin) — just re-add, no setup needed
+				await this.reAddRuntime(entry);
+			} else {
+				// New runtime → add + auto-setup
+				await this.addAndSetupRuntime(entry);
+			}
 			return;
 		}
 
@@ -525,6 +533,22 @@ export class FleetSelectorComponent extends Container implements Focusable {
 		// In fleet → remove from fleet
 		const removed = await removeFleetMember(entry.hostname);
 		this.statusText = removed ? `✓ Removed ${entry.hostname}` : `✗ Failed to remove`;
+		await this.autoDiscover();
+	}
+
+	private async reAddRuntime(entry: FleetEntry): Promise<void> {
+		const transport = entry.transport ?? entry.hostname;
+		const { addFleetMember } = await import("../../../cli/fleet/fleet-config.js");
+		await addFleetMember({
+			name: transport,
+			transport: transport as FleetTransport,
+			tags: ["cloud", transport],
+			addedAt: Date.now(),
+			lastStatus: "active",
+			enabled: true,
+			config: entry.config,
+		});
+		this.statusText = `✓ Re-added ${transport}`;
 		await this.autoDiscover();
 	}
 
