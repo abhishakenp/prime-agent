@@ -81,6 +81,8 @@ export interface FleetConfig {
 	hosts?: FleetHost[];
 	/** Unified fleet members — all transports. */
 	members?: FleetMember[];
+	/** Names of explicitly removed members — prevents re-import from plugin configs. */
+	removed?: string[];
 }
 
 const FLEET_CONFIG_PATH = join(homedir(), ".prime", "agent", "fleet.json");
@@ -118,8 +120,10 @@ export async function loadFleetConfig(): Promise<FleetConfig> {
 
 export async function saveFleetConfig(config: FleetConfig): Promise<void> {
 	await mkdir(dirname(FLEET_CONFIG_PATH), { recursive: true });
-	// Always save in unified format
-	const toSave: FleetConfig = { members: config.members ?? [] };
+	const toSave: FleetConfig = {
+		members: config.members ?? [],
+		removed: config.removed,
+	};
 	await writeFile(FLEET_CONFIG_PATH, `${JSON.stringify(toSave, null, 2)}\n`, "utf-8");
 }
 
@@ -145,6 +149,10 @@ export async function addFleetMember(member: FleetMember): Promise<void> {
 		members.push(member);
 	}
 	config.members = members;
+	// Clear from removed list if re-added
+	if (config.removed?.includes(member.name)) {
+		config.removed = config.removed.filter((n) => n !== member.name);
+	}
 	await saveFleetConfig(config);
 }
 
@@ -154,6 +162,8 @@ export async function removeFleetMember(name: string): Promise<boolean> {
 	const before = members.length;
 	config.members = members.filter((m) => m.name !== name);
 	if (config.members.length === before) return false;
+	// Track removal so importRuntimeMembers doesn't re-add it
+	config.removed = [...new Set([...(config.removed ?? []), name])];
 	await saveFleetConfig(config);
 	return true;
 }
@@ -301,8 +311,10 @@ export async function removeFleetHostTag(hostname: string, tag: string): Promise
  * Idempotent — skips members that already exist.
  */
 export async function importRuntimeMembers(): Promise<number> {
-	const members = await listFleetMembers();
+	const config = await loadFleetConfig();
+	const members = config.members ?? [];
 	const existingNames = new Set(members.map((m) => m.name));
+	const removedNames = new Set(config.removed ?? []);
 	let imported = 0;
 
 	// Map runtime plugin name → transport type
@@ -314,6 +326,7 @@ export async function importRuntimeMembers(): Promise<number> {
 
 	for (const [pluginName, transport] of Object.entries(transportMap)) {
 		if (existingNames.has(pluginName)) continue;
+		if (removedNames.has(pluginName)) continue; // explicitly removed — skip
 
 		try {
 			const { readFile } = await import("node:fs/promises");
