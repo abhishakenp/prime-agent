@@ -32,6 +32,7 @@ export async function selectFleetInteractive(): Promise<void> {
 				process.exit(0);
 			},
 			requestRender: () => ui.requestRender(),
+			ui,
 		});
 
 		ui.addChild(selector);

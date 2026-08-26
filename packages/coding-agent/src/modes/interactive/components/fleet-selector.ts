@@ -20,6 +20,7 @@ import {
 	matchesKey,
 	Spacer,
 	Text,
+	type TUI,
 	truncateToWidth,
 	visibleWidth,
 } from "@earendil-works/pi-tui";
@@ -76,6 +77,8 @@ export interface FleetSelectorOptions {
 	onCancel?: () => void;
 	/** Request a re-render of the parent TUI. */
 	requestRender: () => void;
+	/** The TUI instance — needed for showing setup overlays. */
+	ui?: TUI;
 }
 
 export class FleetSelectorComponent extends Container implements Focusable {
@@ -95,6 +98,7 @@ export class FleetSelectorComponent extends Container implements Focusable {
 	private readonly onDone: () => void;
 	private readonly onCancel: () => void;
 	private readonly requestRender: () => void;
+	private readonly ui: TUI | undefined;
 
 	constructor(options: FleetSelectorOptions);
 	/** @deprecated Legacy positional args — use FleetSelectorOptions. */
@@ -105,11 +109,13 @@ export class FleetSelectorComponent extends Container implements Focusable {
 			this.onDone = args[0] ?? (() => {});
 			this.onCancel = args[1] ?? this.onDone;
 			this.requestRender = args[2] ?? (() => {});
+			this.ui = undefined;
 		} else {
 			const opts = args[0]!;
 			this.onDone = opts.onDone;
 			this.onCancel = opts.onCancel ?? opts.onDone;
 			this.requestRender = opts.requestRender;
+			this.ui = opts.ui;
 		}
 
 		this.searchInput = new Input();
@@ -678,13 +684,33 @@ export class FleetSelectorComponent extends Container implements Focusable {
 				return;
 			}
 
-			// Run interactive setup with real readline prompts
-			// Suspend TUI raw mode so readline + child processes (wrangler login,
-			// gh auth login) work with proper terminal I/O
-			const result = await this.runInteractiveSetup(pluginPath);
+			// Use TUI prompt provider - interactive overlays with search
+			// instead of dropping to a plain readline terminal.
+			if (!this.ui) {
+				// No TUI available - fall back to readline-based setup
+				const result = await this.runInteractiveSetup(pluginPath);
+				this.clearLoading();
+				if (result.success && result.config) {
+					savePluginConfig(transport, result.config);
+					const { updateFleetMemberConfig } = await import("../../../cli/fleet/fleet-config.js");
+					await updateFleetMemberConfig(entry.hostname, result.config);
+					entry.config = result.config;
+					entry.hasConfig = true;
+					this.statusText = `\u2713 ${transport} configured`;
+				} else if (result.message) {
+					this.statusText = result.success ? `\u2713 ${result.message}` : `\u2717 ${result.message}`;
+				} else {
+					this.statusText = `\u2713 ${transport} setup complete`;
+				}
+				this.rebuildChildren();
+				return;
+			}
 
-			// runInteractiveSetup already showed result + waited for Enter
-			// and restored the TUI (alt screen + raw mode + listeners)
+			const { createTuiPromptProvider } = await import("./tui-prompt.js");
+			const prompt = createTuiPromptProvider(this.ui);
+
+			const result = await this.runPluginSetupWithTui(pluginPath, prompt);
+
 			this.clearLoading();
 			if (result.success && result.config) {
 				savePluginConfig(transport, result.config);
@@ -704,6 +730,26 @@ export class FleetSelectorComponent extends Container implements Focusable {
 			this.statusText = `✗ Setup failed: ${err instanceof Error ? err.message : String(err)}`;
 			this.rebuildChildren();
 		}
+	}
+
+	/**
+	 * Run plugin setup using TUI overlays for prompts.
+	 * The setup function uses execSync for gh/wrangler commands (captured,
+	 * no terminal I/O needed). For browser login (gh auth login --web,
+	 * wrangler login), spawn with stdio: "inherit" writes to the alt screen
+	 * buffer; the browser opens externally. After the child exits, the TUI
+	 * re-renders automatically.
+	 */
+	private async runPluginSetupWithTui(
+		pluginPath: string,
+		prompt: {
+			ask: (q: string, def?: string) => Promise<string | undefined>;
+			confirm: (q: string, def?: boolean) => Promise<boolean>;
+			choose: (q: string, options: string[]) => Promise<number>;
+			status: (msg: string) => void;
+		},
+	): Promise<{ success: boolean; message: string; config?: Record<string, unknown> }> {
+		return runPluginSetupWithPath(pluginPath, prompt);
 	}
 
 	/**

@@ -9778,6 +9778,7 @@ export class InteractiveMode {
 			onDone: finish,
 			onCancel: finish,
 			requestRender: () => this.ui.requestRender(),
+			ui: this.ui,
 		});
 
 		handle = this.showFullPaneOverlay(selector, 96);

@@ -69,6 +69,7 @@ type FleetSubcommand =
 	| "status"
 	| "bootstrap"
 	| "runtimes"
+	| "setup"
 	| undefined;
 
 export async function handleFleetCommand(args: string[]): Promise<void> {
@@ -121,6 +122,9 @@ export async function handleFleetCommand(args: string[]): Promise<void> {
 			break;
 		case "runtimes":
 			await runtimesCmd(rest);
+			break;
+		case "setup":
+			await setupCmd(rest);
 			break;
 		default:
 			console.error(chalk.red(`Unknown fleet command: ${subcommand}`));
@@ -771,8 +775,8 @@ async function runtimesCmd(args: string[]): Promise<void> {
 			return;
 		}
 		const { join } = await import("node:path");
-		const { homedir } = await import("node:os");
 		const { pluginHasSetup, runPluginSetupWithPath, savePluginConfig } = await import("./runtime-operations.js");
+		const { homedir } = await import("node:os");
 		const pluginPath = join(homedir(), ".prime", "runtimes", `${name}.mjs`);
 		const hasSetup = await pluginHasSetup(pluginPath);
 		if (!hasSetup) {
@@ -924,4 +928,137 @@ async function runtimesCmd(args: string[]): Promise<void> {
 	console.error(chalk.red(`Unknown runtimes subcommand: ${action}`));
 	console.error(chalk.dim("Available: list, install, uninstall, enable, disable, config"));
 	process.exitCode = 1;
+}
+
+// ─── setup ─────────────────────────────────────────────────────────
+
+/**
+ * Run setup for a fleet member's transport.
+ *
+ * Agent-friendly: accepts --config k=v flags for non-interactive setup.
+ * Without --config flags, runs interactive readline-based setup.
+ *
+ * Usage:
+ *   prime-agent fleet setup <name>                    Interactive setup
+ *   prime-agent fleet setup <name> --config=repo=owner/repo  Non-interactive
+ *   prime-agent fleet setup github-actions --config=repo=owner/repo
+ */
+async function setupCmd(args: string[]): Promise<void> {
+	const name = args[0];
+	if (!name) {
+		console.error(chalk.red("Usage: prime-agent fleet setup <name> [--config key=value...]"));
+		console.error(chalk.dim("  Interactive: prime-agent fleet setup github-actions"));
+		console.error(chalk.dim("  Agent:       prime-agent fleet setup github-actions --config=repo=owner/repo"));
+		process.exitCode = 1;
+		return;
+	}
+
+	// Resolve the fleet member to find its transport
+	const member = await getFleetMember(name);
+	const transport = member?.transport ?? name;
+
+	// Find plugin path
+	const { join } = await import("node:path");
+	const { existsSync } = await import("node:fs");
+	const { userRuntimesDir, builtinRuntimesDir } = await import("../../core/fleet-runtime/runtime-plugin-loader.js");
+	const { pluginHasSetup, runPluginSetupWithPath, savePluginConfig } = await import("./runtime-operations.js");
+
+	const userPath = join(userRuntimesDir(), `${transport}.mjs`);
+	const builtinPath = join(builtinRuntimesDir(), `${transport}.mjs`);
+	const pluginPath = existsSync(userPath) ? userPath : existsSync(builtinPath) ? builtinPath : null;
+
+	if (!pluginPath) {
+		console.error(chalk.red(`No plugin found for ${transport}`));
+		process.exitCode = 1;
+		return;
+	}
+
+	const hasSetup = await pluginHasSetup(pluginPath);
+	if (!hasSetup) {
+		console.log(chalk.dim(`${transport} has no setup flow`));
+		return;
+	}
+
+	// Parse --config flags for non-interactive mode
+	const configArgs = args.filter((a) => a.startsWith("--config="));
+	if (configArgs.length > 0) {
+		const inlineConfig: Record<string, unknown> = {};
+		for (const ca of configArgs) {
+			const kv = ca.slice("--config=".length);
+			const eq = kv.indexOf("=");
+			if (eq > 0) {
+				const key = kv.slice(0, eq);
+				let val: unknown = kv.slice(eq + 1);
+				try {
+					val = JSON.parse(val as string);
+				} catch {}
+				inlineConfig[key] = val;
+			}
+		}
+		savePluginConfig(transport, inlineConfig);
+		// Also update fleet member config
+		if (member) {
+			await updateFleetMemberConfig(name, inlineConfig);
+		}
+		console.log(chalk.green(`✓ Configured ${transport}: ${JSON.stringify(inlineConfig)}`));
+		return;
+	}
+
+	// Interactive setup (readline-based)
+	console.log(chalk.dim(`\n  Running setup for ${transport}...`));
+	const { createInterface } = await import("node:readline");
+	const rl = createInterface({ input: process.stdin, output: process.stdout });
+	let eofResolve: ((val: unknown) => void) | null = null;
+	rl.on("close", () => {
+		if (eofResolve) eofResolve(undefined);
+	});
+	const prompt = {
+		ask: (q: string, def?: string) =>
+			new Promise<string | undefined>((resolve) => {
+				eofResolve = resolve as (val: unknown) => void;
+				rl.question(def ? `${q} [${def}]: ` : `${q}: `, (answer) => {
+					eofResolve = null;
+					const t = answer.trim();
+					resolve(t || def);
+				});
+			}),
+		confirm: (q: string, def?: boolean) =>
+			new Promise<boolean>((resolve) => {
+				eofResolve = resolve as (val: unknown) => void;
+				rl.question(`${q} [${def ? "Y/n" : "y/N"}]: `, (answer) => {
+					eofResolve = null;
+					const a = answer.trim().toLowerCase();
+					resolve(!a ? (def ?? false) : a === "y" || a === "yes");
+				});
+			}),
+		choose: (q: string, options: string[]) =>
+			new Promise<number>((resolve) => {
+				eofResolve = resolve as (val: unknown) => void;
+				console.log(`\n${q}`);
+				options.forEach((opt, i) => {
+					console.log(`  ${i + 1}. ${opt}`);
+				});
+				rl.question(`Choose (1-${options.length}): `, (answer) => {
+					eofResolve = null;
+					const n = Number.parseInt(answer.trim(), 10);
+					resolve(n >= 1 && n <= options.length ? n - 1 : -1);
+				});
+			}),
+		status: (msg: string) => console.log(chalk.dim(`  ${msg}`)),
+	};
+	const setupResult = await runPluginSetupWithPath(pluginPath, prompt);
+	rl.close();
+	if (setupResult.success) {
+		console.log(chalk.green(`✓ ${setupResult.message}`));
+		if (setupResult.config) {
+			savePluginConfig(transport, setupResult.config);
+			if (member) {
+				await updateFleetMemberConfig(name, setupResult.config);
+			}
+			console.log(chalk.dim(`  Config saved to ~/.prime/runtimes/${transport}.json`));
+		}
+	} else {
+		console.error(chalk.red(`✗ ${setupResult.message}`));
+		process.exitCode = 1;
+	}
 }
