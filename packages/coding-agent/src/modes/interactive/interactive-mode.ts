@@ -9761,10 +9761,16 @@ export class InteractiveMode {
 		let handle: OverlayHandle | undefined;
 		let settled = false;
 
+		// Enter alt screen so the fleet TUI has its own clean buffer.
+		// This prevents setup output (stdout writes) from interleaving
+		// with the overlay's differential rendering in the main buffer.
+		this.ui.terminal.enterAltScreen();
+
 		const finish = () => {
 			if (settled) return;
 			settled = true;
 			handle?.hide();
+			this.ui.terminal.leaveAltScreen();
 			this.ui.requestRender();
 		};
 
