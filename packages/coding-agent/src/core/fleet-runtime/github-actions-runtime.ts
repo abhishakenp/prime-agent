@@ -12,7 +12,7 @@
  */
 
 import { execSync, spawn } from "node:child_process";
-import { readFileSync } from "node:fs";
+import { mkdirSync, readdirSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { type AgentIdentitySpec, assembleBundle, type BundleSpec, tarBundle } from "./agent-bundle.js";
 import type {
@@ -115,7 +115,8 @@ export class GitHubActionsRuntime implements AgentRuntime {
 		// Set credentials as GitHub repository secrets (not embedded in YAML)
 		await this.setRepositorySecrets(repo, token, credentialKeys);
 
-		const runId = await this.triggerWorkflow(repo, token, workflowYaml, agentId);
+		const workDir = request.workDir ?? `.prime/agent/sessions/fleet/${agentId}`;
+		const runId = await this.triggerWorkflow(repo, token, workflowYaml, agentId, gistUrl, workDir);
 
 		let currentStatus: AgentStatusInfo = { status: "running" };
 		const eventListeners = new Set<(event: AgentEvent) => void>();
@@ -158,11 +159,13 @@ export class GitHubActionsRuntime implements AgentRuntime {
 	private async uploadBundleGist(tarPath: string, agentId: string): Promise<string> {
 		const tarBase64 = readFileSync(tarPath, "base64");
 		const filename = `bundle-${agentId.slice(0, 8)}.tar.gz.b64`;
+		const token = this.config.token ?? process.env.GITHUB_TOKEN ?? this.getGhToken();
+		if (!token) throw new Error("No GitHub token for gist upload");
 
 		const resp = await fetch("https://api.github.com/gists", {
 			method: "POST",
 			headers: {
-				Authorization: `Bearer ${this.getGhToken()}`,
+				Authorization: `Bearer ${token}`,
 				Accept: "application/vnd.github+json",
 			},
 			body: JSON.stringify({
@@ -187,9 +190,10 @@ export class GitHubActionsRuntime implements AgentRuntime {
 		_prompt: string,
 		credentialKeys: string[],
 		_settings: Record<string, unknown>,
-		gistUrl: string,
+		_gistUrl: string,
 		_request: SpawnRequest,
 	): string {
+		const workDir = _request.workDir ?? `.prime/agent/sessions/fleet/${identity.agentId}`;
 		const lines: string[] = [
 			"name: Prime Agent",
 			"on:",
@@ -198,7 +202,13 @@ export class GitHubActionsRuntime implements AgentRuntime {
 			"      agent_id:",
 			"        description: 'Agent ID'",
 			"        required: true",
-			`        default: '${identity.agentId}'`,
+			"      gist_url:",
+			"        description: 'Bundle Gist URL'",
+			"        required: true",
+			"      work_dir:",
+			"        description: 'Work directory relative to HOME'",
+			"        required: true",
+			`        default: '${workDir}'`,
 			"",
 			"jobs:",
 			"  agent:",
@@ -221,7 +231,8 @@ export class GitHubActionsRuntime implements AgentRuntime {
 			"",
 			"      - name: Download and Extract Agent Bundle",
 			"        run: |",
-			`          curl -sL "${gistUrl}" -o /tmp/bundle.b64`,
+			// biome-ignore lint/suspicious/noTemplateCurlyInString: GitHub Actions syntax
+			'          curl -sL "${{ github.event.inputs.gist_url }}" -o /tmp/bundle.b64',
 			"          base64 -d /tmp/bundle.b64 > /tmp/bundle.tar.gz",
 			"          mkdir -p /tmp/agent-bundle",
 			"          tar xzf /tmp/bundle.tar.gz -C /tmp/agent-bundle",
@@ -234,7 +245,8 @@ export class GitHubActionsRuntime implements AgentRuntime {
 			"        run: |",
 			"          bash $BUNDLE_DIR/run.sh",
 			"        env:",
-			`          AGENT_ID: ${identity.agentId}`,
+			// biome-ignore lint/suspicious/noTemplateCurlyInString: GitHub Actions syntax
+			"          AGENT_ID: ${{ github.event.inputs.agent_id }}",
 		);
 
 		for (const k of credentialKeys) {
@@ -243,14 +255,25 @@ export class GitHubActionsRuntime implements AgentRuntime {
 
 		lines.push(
 			"",
-			"      - name: Upload Results",
+			"      - name: Upload Work Directory",
 			"        if: always()",
 			"        uses: actions/upload-artifact@v4",
 			"        with:",
 			// biome-ignore lint/suspicious/noTemplateCurlyInString: GitHub Actions syntax
-			"          name: agent-results-${{ github.run_id }}",
+			"          name: agent-work-${{ github.run_id }}",
+			// biome-ignore lint/suspicious/noTemplateCurlyInString: GitHub Actions syntax
+			"          path: ${{ format('{0}/{1}', env.HOME, github.event.inputs.work_dir) }}/",
+			"          if-no-files-found: ignore",
+			"",
+			"      - name: Upload Agent Logs",
+			"        if: always()",
+			"        uses: actions/upload-artifact@v4",
+			"        with:",
+			// biome-ignore lint/suspicious/noTemplateCurlyInString: GitHub Actions syntax
+			"          name: agent-logs-${{ github.run_id }}",
 			"          path: |",
 			"            /tmp/agent-bundle/",
+			"          if-no-files-found: ignore",
 		);
 
 		return `${lines.join("\n")}\n`;
@@ -274,6 +297,7 @@ export class GitHubActionsRuntime implements AgentRuntime {
 
 	/** Set credentials as GitHub repository secrets using gh CLI. */
 	private async setRepositorySecrets(repo: string, _token: string, keys: string[]): Promise<void> {
+		const token = this.config.token ?? process.env.GITHUB_TOKEN ?? this.getGhToken();
 		for (const keyName of keys) {
 			const value = process.env[keyName];
 			if (!value) continue;
@@ -282,7 +306,7 @@ export class GitHubActionsRuntime implements AgentRuntime {
 					input: value,
 					encoding: "utf-8",
 					stdio: ["pipe", "pipe", "pipe"],
-					env: process.env,
+					env: { ...process.env, GH_TOKEN: token, GITHUB_TOKEN: token },
 				});
 			} catch (err) {
 				console.error(`Failed to set secret ${keyName}:`, err);
@@ -293,9 +317,15 @@ export class GitHubActionsRuntime implements AgentRuntime {
 	// detectRepo() removed — GitHub Actions runtime now requires a dedicated
 	// repo configured via setup(). No more cwd repo fallback.
 
-	private async triggerWorkflow(repo: string, token: string, workflowYaml: string, agentId: string): Promise<number> {
-		// Push workflow to the default branch (required for workflow_dispatch)
-		const workflowFile = `.github/workflows/agent-${agentId.slice(0, 8)}.yml`;
+	private async triggerWorkflow(
+		repo: string,
+		token: string,
+		workflowYaml: string,
+		agentId: string,
+		gistUrl: string,
+		workDir: string,
+	): Promise<number> {
+		const workflowFile = ".github/workflows/prime-agent.yml";
 
 		// Get the default branch
 		const repoResp = await fetch(`https://api.github.com/repos/${repo}`, {
@@ -304,21 +334,19 @@ export class GitHubActionsRuntime implements AgentRuntime {
 		const repoData = (await repoResp.json()) as { default_branch: string };
 		const defaultBranch = repoData.default_branch;
 
-		// Create or update the workflow file on the default branch
-		// First check if it already exists
+		// Check if the workflow file already exists
 		const checkResp = await fetch(
 			`https://api.github.com/repos/${repo}/contents/${workflowFile}?ref=${defaultBranch}`,
-			{
-				headers: { Authorization: `Bearer ${token}`, Accept: "application/vnd.github+json" },
-			},
+			{ headers: { Authorization: `Bearer ${token}`, Accept: "application/vnd.github+json" } },
 		);
 		const existingSha = checkResp.ok ? ((await checkResp.json()) as { sha?: string }).sha : undefined;
 
+		// Create or update the workflow file
 		const fileResp = await fetch(`https://api.github.com/repos/${repo}/contents/${workflowFile}`, {
 			method: "PUT",
 			headers: { Authorization: `Bearer ${token}`, Accept: "application/vnd.github+json" },
 			body: JSON.stringify({
-				message: `Deploy agent ${agentId.slice(0, 8)}`,
+				message: `Update prime-agent workflow`,
 				content: Buffer.from(workflowYaml).toString("base64"),
 				branch: defaultBranch,
 				...(existingSha ? { sha: existingSha } : {}),
@@ -329,32 +357,42 @@ export class GitHubActionsRuntime implements AgentRuntime {
 			throw new Error(`Failed to create workflow file: ${fileResp.status} ${errText}`);
 		}
 
-		// Wait for GitHub to index the workflow
-		await new Promise((r) => setTimeout(r, 15000));
+		// Trigger with retries — GitHub may need time to index a new workflow file
+		const triggerUrl = `https://api.github.com/repos/${repo}/actions/workflows/prime-agent.yml/dispatches`;
+		const triggerBody = JSON.stringify({
+			ref: defaultBranch,
+			inputs: { agent_id: agentId, gist_url: gistUrl, work_dir: workDir },
+		});
+		const triggerHeaders = { Authorization: `Bearer ${token}`, Accept: "application/vnd.github+json" };
 
-		// Trigger workflow_dispatch on the default branch
-		const workflowFilename = workflowFile.split("/").pop();
-		const triggerResp = await fetch(
-			`https://api.github.com/repos/${repo}/actions/workflows/${workflowFilename}/dispatches`,
-			{
+		let triggered = false;
+		for (let attempt = 0; attempt < 12; attempt++) {
+			await new Promise((r) => setTimeout(r, 10000));
+			const triggerResp = await fetch(triggerUrl, {
 				method: "POST",
-				headers: { Authorization: `Bearer ${token}`, Accept: "application/vnd.github+json" },
-				body: JSON.stringify({ ref: defaultBranch, inputs: { agent_id: agentId } }),
-			},
-		);
-
-		if (!triggerResp.ok) {
-			const errText = await triggerResp.text();
-			throw new Error(`Failed to trigger workflow: ${triggerResp.status} ${errText}`);
+				headers: triggerHeaders,
+				body: triggerBody,
+			});
+			if (triggerResp.ok) {
+				triggered = true;
+				break;
+			}
+			if (triggerResp.status !== 404 && triggerResp.status !== 422) {
+				const errText = await triggerResp.text();
+				throw new Error(`Failed to trigger workflow: ${triggerResp.status} ${errText}`);
+			}
+		}
+		if (!triggered) {
+			throw new Error("Failed to trigger workflow after 12 retries (workflow not indexed)");
 		}
 
 		// Poll for the run ID
 		await new Promise((r) => setTimeout(r, 5000));
 		const runsResp = await fetch(
-			`https://api.github.com/repos/${repo}/actions/workflows/${workflowFilename}/runs?per_page=1`,
+			`https://api.github.com/repos/${repo}/actions/workflows/prime-agent.yml/runs?per_page=1`,
 			{ headers: { Authorization: `Bearer ${token}`, Accept: "application/vnd.github+json" } },
 		);
-		const runsData = (await runsResp.json()) as { workflow_runs: Array<{ id: number }> };
+		const runsData = (await runsResp.json()) as { workflow_runs: Array<{ id: number; created_at: string }> };
 		return runsData.workflow_runs[0]?.id ?? 0;
 	}
 
@@ -421,15 +459,49 @@ export class GitHubActionsRuntime implements AgentRuntime {
 				const dlResp = await fetch(artifact.archive_download_url, {
 					headers: { Authorization: `Bearer ${token}`, Accept: "application/vnd.github+json" },
 				});
-				if (dlResp.ok) {
-					// Would need to unzip and read — placeholder
-					files[artifact.name] = "artifact downloaded";
-				}
+				if (!dlResp.ok) continue;
+				const zipBuffer = Buffer.from(await dlResp.arrayBuffer());
+				const extracted = await this.extractZipFiles(zipBuffer);
+				Object.assign(files, extracted);
 			}
 			return files;
 		} catch {
 			return {};
 		}
+	}
+
+	private async extractZipFiles(zipBuffer: Buffer): Promise<Record<string, string>> {
+		const { spawn } = await import("node:child_process");
+		const tmpDir = `/tmp/agent-artifacts-${Date.now()}`;
+		const zipPath = `${tmpDir}.zip`;
+		writeFileSync(zipPath, zipBuffer);
+		mkdirSync(tmpDir, { recursive: true });
+
+		await new Promise<void>((resolve, reject) => {
+			const unzip = spawn("unzip", ["-o", zipPath, "-d", tmpDir], { stdio: ["pipe", "pipe", "pipe"] });
+			unzip.on("exit", (code) => (code === 0 ? resolve() : reject(new Error(`unzip exited ${code}`))));
+			unzip.on("error", reject);
+		});
+
+		const files: Record<string, string> = {};
+		const collectFiles = (dir: string, base = "") => {
+			for (const entry of readdirSync(dir, { withFileTypes: true })) {
+				const fullPath = join(dir, entry.name);
+				const relPath = base ? `${base}/${entry.name}` : entry.name;
+				if (entry.isDirectory()) {
+					collectFiles(fullPath, relPath);
+				} else {
+					try {
+						files[relPath] = readFileSync(fullPath, "utf-8");
+					} catch {}
+				}
+			}
+		};
+		try {
+			collectFiles(tmpDir);
+		} catch {}
+
+		return files;
 	}
 }
 

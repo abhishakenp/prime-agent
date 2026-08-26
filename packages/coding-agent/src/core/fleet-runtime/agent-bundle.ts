@@ -271,12 +271,9 @@ export async function assembleBundle(spec: BundleSpec): Promise<string> {
 set -e
 
 # AgentBundle entry point — self-contained, runs anywhere with Node.js
-# Like Needle: one artifact, everything inside, runs on any host with bash + node.
 BUNDLE_DIR="$(cd "$(dirname "$0")" && pwd)"
-SOCK_DIR="/tmp/prime-agent-\${$}"
-SOCK_PATH="$SOCK_DIR/daemon.sock"
 
-# Load environment variables from env.json — use process substitution to avoid subshell
+# Load environment variables from env.json
 if [ -f "$BUNDLE_DIR/agent/env.json" ]; then
   while IFS= read -r -d '' pair; do
     export "\${pair%%=*}=\${pair#*=}"
@@ -289,7 +286,7 @@ fi
 # Install external deps if missing
 cd "$BUNDLE_DIR/runtime"
 if [ ! -d "node_modules" ]; then
-  npm install --production zeromq undici 2>/dev/null || true
+  npm install --production 2>/dev/null || true
 fi
 
 # Create work directory
@@ -301,29 +298,9 @@ if [ -d "$BUNDLE_DIR/files" ]; then
   cp -r "$BUNDLE_DIR/files/"* "$WORK_DIR/" 2>/dev/null || true
 fi
 
-# Start the daemon in the background with a unique socket
-mkdir -p "$SOCK_DIR"
-node "$BUNDLE_DIR/runtime/cli.js" --mode daemon --daemon-socket "$SOCK_PATH" &
-DAEMON_PID=$!
-
-# Wait for daemon to be ready (up to 60s)
-for i in $(seq 1 60); do
-  if [ -S "$SOCK_PATH" ]; then
-    break
-  fi
-  sleep 1
-done
-
-if [ ! -S "$SOCK_PATH" ]; then
-  echo "ERROR: Daemon failed to start"
-  kill $DAEMON_PID 2>/dev/null
-  exit 1
-fi
-
-# Run the agent in print mode, connecting to our daemon
+# Run the agent in print mode (no daemon needed — print mode is self-contained)
 node "$BUNDLE_DIR/runtime/cli.js" \\
   --print \\
-  --daemon-socket "$SOCK_PATH" \\
   --prompt "$(cat "$BUNDLE_DIR/agent/prompt.txt")" \\
   --session-id "${spec.identity.agentId}" \\
   --cwd "$WORK_DIR" \\
@@ -333,10 +310,6 @@ node "$BUNDLE_DIR/runtime/cli.js" \\
   ${model ? `--model ${model}` : ""} \\
   "$@"
 EXIT_CODE=$?
-
-# Cleanup: kill daemon and remove socket
-kill $DAEMON_PID 2>/dev/null
-rm -rf "$SOCK_DIR"
 
 exit $EXIT_CODE
 `;

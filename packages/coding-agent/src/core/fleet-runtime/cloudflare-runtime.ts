@@ -198,6 +198,8 @@ const SETTINGS = ${settingsJson};
 // Agent state
 let agentStatus = "pending";
 let startedAt = 0;
+let agentError = null;
+let agentAnswer = null;
 
 export default {
   async fetch(request, env, ctx) {
@@ -213,6 +215,8 @@ export default {
         info: {
           status: agentStatus,
           durationMs: startedAt > 0 ? Date.now() - startedAt : 0,
+          error: agentError,
+          answer: agentAnswer,
         },
       });
     }
@@ -305,8 +309,23 @@ async function runAgent(env) {
   sendEvent("log", { content: "Agent started on Cloudflare Worker" });
 
   // Call the LLM API using the included credentials
-  const model = SETTINGS.defaultModel || MODEL;
-  const provider = SETTINGS.defaultProvider || "openrouter";
+  const model = MODEL || SETTINGS.defaultModel || "";
+  // Auto-detect provider from model name if not explicitly set
+  let provider = SETTINGS.defaultProvider || "";
+  if (!provider || provider === "openrouter") {
+    // Check if model matches a known provider pattern
+    if (model.startsWith("gemini-") && ENV_VARS.GEMINI_API_KEY) {
+      provider = "gemini";
+    } else if (model.startsWith("deepseek") && ENV_VARS.DEEPSEEK_API_KEY) {
+      provider = "deepseek";
+    } else if (model.startsWith("claude") && ENV_VARS.ANTHROPIC_API_KEY) {
+      provider = "anthropic";
+    } else if (model.startsWith("gpt") && ENV_VARS.OPENAI_API_KEY) {
+      provider = "openai";
+    } else if (ENV_VARS.OPENROUTER_API_KEY) {
+      provider = "openrouter";
+    }
+  }
 
   // Determine API endpoint and key from the bundled credentials
   let apiUrl = null;
@@ -355,27 +374,34 @@ async function runAgent(env) {
           ? result.candidates?.[0]?.content?.parts?.[0]?.text
           : result.choices?.[0]?.message?.content;
 
-        sendEvent("message", { content: answer || "No response", role: "assistant" });
+        agentAnswer = answer || "No response";
+        sendEvent("message", { content: agentAnswer, role: "assistant" });
         sendEvent("status", {
           status: "completed",
-          answerPreview: (answer || "").slice(0, 200),
+          answerPreview: (agentAnswer || "").slice(0, 200),
           durationMs: Date.now() - startedAt,
         });
         agentStatus = "completed";
       } else {
         const errText = await response.text();
-        sendEvent("log", { content: "LLM API error: " + response.status + " " + errText.slice(0, 200) });
-        sendEvent("status", { status: "error", error: "LLM API error: " + response.status });
+        agentError = "LLM API error: " + response.status + " " + errText.slice(0, 500);
+        console.error(agentError);
+        sendEvent("log", { content: agentError });
+        sendEvent("status", { status: "error", error: agentError });
         agentStatus = "error";
       }
     } catch (err) {
-      sendEvent("log", { content: "LLM fetch error: " + err.message });
-      sendEvent("status", { status: "error", error: err.message });
+      agentError = "LLM fetch error: " + err.message;
+      console.error(agentError);
+      sendEvent("log", { content: agentError });
+      sendEvent("status", { status: "error", error: agentError });
       agentStatus = "error";
     }
   } else {
-    sendEvent("log", { content: "No LLM credentials found for provider: " + provider });
-    sendEvent("status", { status: "error", error: "No LLM credentials" });
+    agentError = "No LLM credentials found for provider: " + provider;
+    console.error(agentError);
+    sendEvent("log", { content: agentError });
+    sendEvent("status", { status: "error", error: agentError });
     agentStatus = "error";
   }
 
@@ -385,20 +411,26 @@ async function runAgent(env) {
 	}
 
 	private async deployWorker(name: string, script: string): Promise<{ deployed: boolean; url?: string }> {
-		const apiToken = this.config.apiToken ?? process.env.CLOUDFLARE_API_TOKEN;
+		const apiToken = this.config.apiToken ?? process.env.CLOUDFLARE_API_TOKEN ?? this.getWranglerToken();
 		const accountId = this.config.accountId ?? process.env.CLOUDFLARE_ACCOUNT_ID;
 
 		if (apiToken && accountId) {
 			try {
+				const metadata = JSON.stringify({
+					main_module: "worker.js",
+					compatibility_date: "2024-09-23",
+					compatibility_flags: ["nodejs_compat"],
+				});
+				const formData = new FormData();
+				formData.append("worker.js", new Blob([script], { type: "application/javascript+module" }), "worker.js");
+				formData.append("metadata", new Blob([metadata], { type: "application/json" }), "metadata");
+
 				const resp = await fetch(
 					`https://api.cloudflare.com/client/v4/accounts/${accountId}/workers/scripts/${name}`,
 					{
 						method: "PUT",
-						headers: {
-							Authorization: `Bearer ${apiToken}`,
-							"Content-Type": "application/javascript",
-						},
-						body: script,
+						headers: { Authorization: `Bearer ${apiToken}` },
+						body: formData,
 					},
 				);
 				if (resp.ok) {
@@ -489,7 +521,7 @@ async function runAgent(env) {
 	}
 
 	private async destroyWorker(name: string): Promise<void> {
-		const apiToken = this.config.apiToken ?? process.env.CLOUDFLARE_API_TOKEN;
+		const apiToken = this.config.apiToken ?? process.env.CLOUDFLARE_API_TOKEN ?? this.getWranglerToken();
 		const accountId = this.config.accountId ?? process.env.CLOUDFLARE_ACCOUNT_ID;
 		if (apiToken && accountId) {
 			try {
@@ -498,6 +530,18 @@ async function runAgent(env) {
 					headers: { Authorization: `Bearer ${apiToken}` },
 				});
 			} catch {}
+		}
+	}
+
+	private getWranglerToken(): string | undefined {
+		try {
+			const configPath = join(homedir(), "Library/Preferences/.wrangler/config/default.toml");
+			if (!existsSync(configPath)) return undefined;
+			const content = readFileSync(configPath, "utf-8");
+			const match = content.match(/oauth_token\s*=\s*"([^"]+)"/);
+			return match?.[1];
+		} catch {
+			return undefined;
 		}
 	}
 }
