@@ -200,9 +200,6 @@ export class FleetSelectorComponent extends Container implements Focusable {
 		try {
 			for await (const device of discoverStream({ probeTimeoutMs: 2000 })) {
 				this.mergeDevice(device);
-				if (this.currentView === "main") {
-					this.applyFilter();
-				}
 			}
 		} catch {
 			// Discovery interrupted — keep what we have
@@ -663,6 +660,22 @@ export class FleetSelectorComponent extends Container implements Focusable {
 			// gh auth login) work with proper terminal I/O
 			const result = await this.runInteractiveSetup(pluginPath);
 
+			// Show result before returning to TUI
+			console.log(`\n${result.success ? "✓" : "✗"} ${result.message}`);
+			console.log("\nPress Enter to return to fleet manager...");
+
+			// Wait for keypress before restoring TUI
+			await new Promise<void>((resolve) => {
+				const stdin = process.stdin;
+				const handler = () => {
+					stdin.removeListener("data", handler);
+					stdin.pause();
+					resolve();
+				};
+				stdin.once("data", handler);
+				stdin.resume();
+			});
+
 			this.clearLoading();
 
 			if (result.success && result.config) {
@@ -702,17 +715,19 @@ export class FleetSelectorComponent extends Container implements Focusable {
 		// so readline and child processes (wrangler login, gh auth login)
 		// get proper terminal I/O
 		const stdin = process.stdin;
-		const wasRaw = stdin.isTTY && stdin.isRaw;
 
 		// Save and remove all existing data listeners (TUI's input handler)
 		const originalListeners = stdin.listeners("data") as ((chunk: Buffer) => void)[];
 		stdin.removeAllListeners("data");
 		stdin.pause();
 
-		if (wasRaw) stdin.setRawMode(false);
+		// Exit raw mode
+		if (stdin.setRawMode) {
+			stdin.setRawMode(false);
+		}
 
 		// Clear screen artifacts, print separator
-		process.stdout.write("\n\n");
+		process.stdout.write("\n\n--- Setup ---\n\n");
 
 		const rl = createInterface({ input: stdin, output: process.stdout });
 
@@ -762,7 +777,9 @@ export class FleetSelectorComponent extends Container implements Focusable {
 			for (const listener of originalListeners) {
 				stdin.on("data", listener);
 			}
-			if (wasRaw) stdin.setRawMode(true);
+			if (stdin.setRawMode) {
+				stdin.setRawMode(true);
+			}
 			stdin.resume();
 			// Re-render TUI
 			this.rebuildChildren();
