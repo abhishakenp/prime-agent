@@ -583,8 +583,22 @@ export async function setupCloudflare(
 		const confirmed = await prompt.confirm("Open Cloudflare login in browser? (runs: npx wrangler login)", true);
 		if (confirmed) {
 			prompt.status("Running: npx wrangler login (follow prompts in browser)...");
+			prompt.status("Waiting for browser callback on localhost:8976...");
 			try {
-				execSync("npx wrangler login", { encoding: "utf-8", stdio: "inherit", timeout: 120000 });
+				// Use spawn (async) instead of execSync so the event loop isn't blocked
+				// and the callback server can properly handle the browser redirect
+				await new Promise<void>((resolve, reject) => {
+					const child = spawn("npx", ["wrangler", "login"], {
+						stdio: "inherit",
+						env: { ...process.env },
+						timeout: 120000,
+					});
+					child.on("error", reject);
+					child.on("exit", (code) => {
+						if (code === 0) resolve();
+						else reject(new Error(`wrangler login exited with code ${code}`));
+					});
+				});
 				// Re-check auth
 				whoamiOutput = execSync("npx wrangler whoami 2>&1", {
 					encoding: "utf-8",
@@ -592,10 +606,10 @@ export async function setupCloudflare(
 					timeout: 15000,
 				});
 				authed = !whoamiOutput.includes("not authenticated");
-			} catch {
+			} catch (err) {
 				return {
 					success: false,
-					message: "Cloudflare login failed. Run `npx wrangler login` manually and retry.",
+					message: `Cloudflare login failed: ${err instanceof Error ? err.message : String(err)}. Run \`npx wrangler login\` manually and retry.`,
 				};
 			}
 		} else {

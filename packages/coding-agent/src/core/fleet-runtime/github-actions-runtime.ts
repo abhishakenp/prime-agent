@@ -11,7 +11,7 @@
  * The target (GH Actions) needs nothing — the bundle IS the workflow.
  */
 
-import { execSync } from "node:child_process";
+import { execSync, spawn } from "node:child_process";
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
 import { type AgentIdentitySpec, assembleBundle, type BundleSpec, tarBundle } from "./agent-bundle.js";
@@ -482,12 +482,24 @@ export async function setupGitHubActions(
 		if (confirmed) {
 			prompt.status("Running: gh auth login --web (follow prompts in terminal)...");
 			try {
-				execSync("gh auth login --web", { encoding: "utf-8", stdio: "inherit" });
+				// Use spawn (async) so the event loop isn't blocked and
+				// interactive prompts from gh auth login work properly
+				await new Promise<void>((resolve, reject) => {
+					const child = spawn("gh", ["auth", "login", "--web"], {
+						stdio: "inherit",
+						env: { ...process.env },
+					});
+					child.on("error", reject);
+					child.on("exit", (code) => {
+						if (code === 0) resolve();
+						else reject(new Error(`gh auth login exited with code ${code}`));
+					});
+				});
 				authed = true;
-			} catch {
+			} catch (err) {
 				return {
 					success: false,
-					message: "GitHub login failed. Run `gh auth login` manually and retry.",
+					message: `GitHub login failed: ${err instanceof Error ? err.message : String(err)}. Run \`gh auth login\` manually and retry.`,
 				};
 			}
 		} else {
