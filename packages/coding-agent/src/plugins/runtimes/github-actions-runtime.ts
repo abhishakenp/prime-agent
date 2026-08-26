@@ -30,6 +30,12 @@ import type {
 	SpawnRequest,
 	SpawnResult,
 } from "../../core/fleet-runtime/agent-runtime.js";
+import {
+	ensureAccount,
+	isProvisionerAlive,
+	type LeasedAccount,
+	releaseAccount,
+} from "../../core/fleet-runtime/provisioner-client.js";
 
 export interface GitHubActionsRuntimeConfig {
 	token?: string;
@@ -106,15 +112,27 @@ export class GitHubActionsRuntime implements AgentRuntime {
 		const workflowYaml = this.generateWorkflowYaml(identity, prompt, credentialKeys, settings, gistUrl, request);
 
 		// Deploy the workflow and trigger it
-		const token = this.config.token ?? process.env.GITHUB_TOKEN ?? this.getGhToken();
-		// Use config repo (dedicated runs repo) — do NOT fall back to cwd repo.
-		// The setup() flow creates a dedicated private repo for agent runs.
-		const repo = this.config.repo;
+		// Multi-account: try config first, then provisioner pool, then gh CLI
+		let token = this.config.token ?? process.env.GITHUB_TOKEN ?? this.getGhToken();
+		let repo = this.config.repo;
+		let leasedAccount: LeasedAccount | null = null;
 
-		if (!token) throw new Error("No GitHub token. Set GITHUB_TOKEN or run `gh auth login`.");
+		// If no token/repo in config, try leasing from provisioner pool
+		if ((!token || !repo) && (await isProvisionerAlive())) {
+			try {
+				leasedAccount = await ensureAccount("github-actions");
+				token = leasedAccount.apiKey;
+				// The provisioner stores repo in metadata
+				repo = (leasedAccount.metadata?.repo as string) || repo;
+			} catch (err) {
+				console.error(`[github-actions] Provisioner lease failed: ${err}`);
+			}
+		}
+
+		if (!token) throw new Error("No GitHub token. Set GITHUB_TOKEN, run `gh auth login`, or start the provisioner.");
 		if (!repo)
 			throw new Error(
-				"No repo configured. Run `prime-agent fleet runtimes install github-actions` to set up a dedicated repo.",
+				"No repo configured. Run `prime-agent fleet runtimes install github-actions` or provision via the provisioner.",
 			);
 
 		// Set credentials as GitHub repository secrets (not embedded in YAML)
@@ -143,6 +161,10 @@ export class GitHubActionsRuntime implements AgentRuntime {
 			abort: async () => {
 				currentStatus = { ...currentStatus, status: "aborted", error: "Aborted by parent" };
 				await this.cancelRun(repo, token, runId);
+				if (leasedAccount) {
+					await releaseAccount("github-actions", leasedAccount.email).catch(() => {});
+					leasedAccount = null;
+				}
 				for (const listener of eventListeners) {
 					listener({ type: "status", status: "aborted", info: currentStatus });
 				}

@@ -26,6 +26,12 @@ import type {
 	SpawnRequest,
 	SpawnResult,
 } from "../../core/fleet-runtime/agent-runtime.js";
+import {
+	ensureAccount,
+	isProvisionerAlive,
+	type LeasedAccount,
+	releaseAccount,
+} from "../../core/fleet-runtime/provisioner-client.js";
 
 export interface CloudflareRuntimeConfig {
 	apiToken?: string;
@@ -124,6 +130,16 @@ export class CloudflareRuntime implements AgentRuntime {
 						if (resp.ok) {
 							const data = (await resp.json()) as { status: AgentStatus; info?: AgentStatusInfo };
 							currentStatus = data.info ?? { status: data.status };
+							// Release account back to pool when done
+							if (
+								this.leasedCfAccount &&
+								(currentStatus.status === "completed" ||
+									currentStatus.status === "error" ||
+									currentStatus.status === "aborted")
+							) {
+								await releaseAccount("cloudflare-workers", this.leasedCfAccount.email).catch(() => {});
+								this.leasedCfAccount = null;
+							}
 							return currentStatus;
 						}
 					} catch {}
@@ -137,6 +153,10 @@ export class CloudflareRuntime implements AgentRuntime {
 			abort: async () => {
 				currentStatus = { ...currentStatus, status: "aborted", error: "Aborted by parent" };
 				await this.destroyWorker(workerName);
+				if (this.leasedCfAccount) {
+					await releaseAccount("cloudflare-workers", this.leasedCfAccount.email).catch(() => {});
+					this.leasedCfAccount = null;
+				}
 				for (const listener of eventListeners) {
 					listener({ type: "status", status: "aborted", info: currentStatus });
 				}
@@ -410,9 +430,22 @@ async function runAgent(env) {
 `;
 	}
 
+	private leasedCfAccount: LeasedAccount | null = null;
+
 	private async deployWorker(name: string, script: string): Promise<{ deployed: boolean; url?: string }> {
-		const apiToken = this.config.apiToken ?? process.env.CLOUDFLARE_API_TOKEN ?? this.getWranglerToken();
-		const accountId = this.config.accountId ?? process.env.CLOUDFLARE_ACCOUNT_ID;
+		let apiToken = this.config.apiToken ?? process.env.CLOUDFLARE_API_TOKEN ?? this.getWranglerToken();
+		let accountId = this.config.accountId ?? process.env.CLOUDFLARE_ACCOUNT_ID;
+
+		// Multi-account: if no config, try leasing from provisioner pool
+		if ((!apiToken || !accountId) && (await isProvisionerAlive())) {
+			try {
+				this.leasedCfAccount = await ensureAccount("cloudflare-workers");
+				apiToken = this.leasedCfAccount.apiKey;
+				accountId = (this.leasedCfAccount.metadata?.accountId as string) || accountId;
+			} catch (err) {
+				console.error(`[cloudflare] Provisioner lease failed: ${err}`);
+			}
+		}
 
 		if (apiToken && accountId) {
 			try {

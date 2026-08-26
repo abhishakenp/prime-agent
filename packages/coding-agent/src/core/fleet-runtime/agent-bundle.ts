@@ -189,6 +189,17 @@ export async function assembleBundle(spec: BundleSpec): Promise<string> {
 	const agentSettings = existsSync(settingsSrc) ? JSON.parse(readFileSync(settingsSrc, "utf-8")) : {};
 	if (spec.model) agentSettings.defaultModel = spec.model;
 	if (spec.provider) agentSettings.defaultProvider = spec.provider;
+	// Override settings with inferred provider if we detected one (see step 9)
+	// This prevents OpenRouter from being used when a direct provider key exists
+	if (spec.model?.startsWith("gemini-") && !spec.provider) {
+		agentSettings.defaultProvider = "google";
+	} else if (spec.model?.startsWith("deepseek") && !spec.provider) {
+		agentSettings.defaultProvider = "deepseek";
+	} else if (spec.model?.startsWith("claude") && !spec.provider) {
+		agentSettings.defaultProvider = "anthropic";
+	} else if (spec.model?.startsWith("gpt") && !spec.provider) {
+		agentSettings.defaultProvider = "openai";
+	}
 	writeFileSync(join(agentDir, "settings.json"), JSON.stringify(agentSettings, null, 2), "utf-8");
 
 	// 6. Collect env vars (credentials + config)
@@ -261,12 +272,37 @@ export async function assembleBundle(spec: BundleSpec): Promise<string> {
 	};
 	writeFileSync(join(bundleDir, "manifest.json"), JSON.stringify(manifest, null, 2), "utf-8");
 
+	// 8b. Write a package.json for the runtime dir listing external deps
+	// These are native/interop packages that can't be bundled — they must be npm-installed on the target.
+	const runtimePkgJson = {
+		name: "prime-agent-bundle-runtime",
+		version: "1.0.0",
+		private: true,
+		type: "module",
+		dependencies: {
+			zeromq: "^6.1.2",
+			koffi: "^2.12.0",
+			undici: "^7.0.0",
+		},
+	};
+	writeFileSync(join(bundleDir, "runtime", "package.json"), JSON.stringify(runtimePkgJson, null, 2), "utf-8");
+
 	// 9. Write the entry point script
 	const workDir = spec.workDir ?? `.prime/agent/sessions/fleet/${spec.identity.agentId}`;
 	const settingsPath = join(homedir(), ".prime", "agent", "settings.json");
 	const settings = existsSync(settingsPath) ? JSON.parse(readFileSync(settingsPath, "utf-8")) : {};
-	const provider = spec.provider ?? settings.defaultProvider ?? "";
+	let provider = spec.provider ?? settings.defaultProvider ?? "";
 	const model = spec.model ?? settings.defaultModel ?? "";
+
+	// Infer provider from model name when provider is OpenRouter (default) but
+	// a provider-specific model is supplied. This avoids routing Gemini models
+	// through OpenRouter (which charges credits) when a direct API key exists.
+	if ((!provider || provider === "openrouter") && model) {
+		if (model.startsWith("gemini-") || model.startsWith("gemma-")) provider = "google";
+		else if (model.startsWith("deepseek")) provider = "deepseek";
+		else if (model.startsWith("claude")) provider = "anthropic";
+		else if (model.startsWith("gpt")) provider = "openai";
+	}
 	const runScript = `#!/bin/bash
 set -e
 

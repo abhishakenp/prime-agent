@@ -22,17 +22,17 @@ import { build } from "esbuild";
 const packageDir = dirname(dirname(fileURLToPath(import.meta.url)));
 const outDir = join(packageDir, "dist", "plugins", "runtimes");
 
-// Runtime entry points — only SSH is built-in.
-// CF, GH Actions, and all other runtimes are user-created plugins.
+// Runtime entry points — only SSH is built-in (lives in core/fleet-runtime/).
+// CF, GH Actions, and all other runtimes are plugins (live in src/plugins/runtimes/).
 // Templates for those are generated to dist/plugins/templates/ for users/agents
 // to copy into ~/.prime/runtimes/ when needed.
 const builtInRuntimes = [
-	{ name: "ssh", entry: "ssh-runtime.ts", setupExport: null },
+	{ name: "ssh", entry: "core/fleet-runtime/ssh-runtime.ts", setupExport: null },
 ];
 
 const templateRuntimes = [
-	{ name: "cloudflare", entry: "cloudflare-runtime.ts", setupExport: "setupCloudflare" },
-	{ name: "github-actions", entry: "github-actions-runtime.ts", setupExport: "setupGitHubActions" },
+	{ name: "cloudflare", entry: "plugins/runtimes/cloudflare-runtime.ts", setupExport: "setupCloudflare" },
+	{ name: "github-actions", entry: "plugins/runtimes/github-actions-runtime.ts", setupExport: "setupGitHubActions" },
 ];
 
 rmSync(outDir, { recursive: true, force: true });
@@ -40,7 +40,7 @@ mkdirSync(outDir, { recursive: true });
 
 // 1. Build built-in plugins (only SSH)
 for (const { name, entry, setupExport } of builtInRuntimes) {
-	const entryPath = join(packageDir, "src", "core", "fleet-runtime", entry);
+	const entryPath = join(packageDir, "src", entry);
 	const outFile = join(outDir, `${name}.mjs`);
 
 	// esbuild bundles everything into one file — the setup function is already
@@ -76,7 +76,7 @@ const templateDir = join(packageDir, "dist", "plugins", "templates");
 mkdirSync(templateDir, { recursive: true });
 
 for (const { name, entry, setupExport } of templateRuntimes) {
-	const entryPath = join(packageDir, "src", "core", "fleet-runtime", entry);
+	const entryPath = join(packageDir, "src", entry);
 	const outFile = join(templateDir, `${name}.mjs`);
 
 	const setupLine = setupExport ? `export { ${setupExport} as setup };` : "";

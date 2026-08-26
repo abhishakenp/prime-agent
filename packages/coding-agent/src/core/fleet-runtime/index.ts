@@ -11,15 +11,18 @@
  * - Can recursively spawn sub-agents on other hosts
  * - Communicates back through the gateway
  *
- * Runtime adapters:
+ * Core runtime adapters (built-in):
  * - LocalRuntime: in-process (existing behavior, default)
  * - SSHRuntime: SSH to a fleet host, run prime-agent --headless
+ *
+ * Plugin runtimes (loaded from ~/.prime/runtimes/ or dist/plugins/):
  * - CloudflareRuntime: deploy a CF Worker
  * - GitHubActionsRuntime: trigger a GH Actions workflow
+ * - Custom runtimes: any .mjs plugin implementing AgentRuntime
  *
  * Usage from RLM:
  *   handle = await rlm("task", host="a2")        # SSH to VPS
- *   handle = await rlm("task", host="cloudflare") # CF Workers
+ *   handle = await rlm("task", host="cloudflare") # CF Workers (plugin)
  *   handle = await rlm("task")                    # local (existing)
  */
 
@@ -41,7 +44,6 @@ export {
 	type SpawnRequest,
 	type SpawnResult,
 } from "./agent-runtime.js";
-export { CloudflareRuntime, type CloudflareRuntimeConfig } from "./cloudflare-runtime.js";
 export {
 	type FileSyncHandler,
 	type FileSyncRequest,
@@ -51,8 +53,18 @@ export {
 	validateSyncPath,
 } from "./file-sync.js";
 export { type FleetRlmChild, type FleetRlmSpawnParams, spawnFleetChild } from "./fleet-rlm-spawn.js";
-export { GitHubActionsRuntime, type GitHubActionsRuntimeConfig } from "./github-actions-runtime.js";
 export { LocalRuntime, type LocalSpawnHandlers } from "./local-runtime.js";
+export {
+	ensureAccount,
+	isProvisionerAlive,
+	type LeasedAccount,
+	leaseAccount,
+	leaseAccounts,
+	listAccounts,
+	type ProvisionResult,
+	provisionAccounts,
+	releaseAccount,
+} from "./provisioner-client.js";
 export {
 	buildRuntimeRegistry,
 	builtinRuntimesDir,
