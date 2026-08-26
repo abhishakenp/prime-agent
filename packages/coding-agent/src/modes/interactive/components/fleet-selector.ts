@@ -116,9 +116,9 @@ export class FleetSelectorComponent extends Container implements Focusable {
 		this.isLoading = true;
 		this.statusText = "Discovering networked devices...";
 
-		// Don't rebuildChildren() here — autoDiscover() will call
-		// applyFilter() → rebuildChildren() once when ready.
-		// Rendering twice (loading + list) causes duplicate FLEET frames.
+		// Render the loading screen once, then autoDiscover() will
+		// render the full list when ready.
+		this.rebuildChildren();
 		void this.autoDiscover();
 	}
 
@@ -204,9 +204,16 @@ export class FleetSelectorComponent extends Container implements Focusable {
 		// This avoids duplicate FLEET frames.
 
 		try {
-			for await (const device of discoverStream({ probeTimeoutMs: 2000 })) {
-				this.mergeDevice(device);
-			}
+			// discoverStream can hang indefinitely if a source (Tailscale,
+			// multicast, etc.) never yields and never completes. Race it
+			// against a timeout — whatever devices we've found so far, keep.
+			const DISCOVERY_TIMEOUT_MS = 8000;
+			const discoveryPromise = (async () => {
+				for await (const device of discoverStream({ probeTimeoutMs: 2000 })) {
+					this.mergeDevice(device);
+				}
+			})();
+			await Promise.race([discoveryPromise, new Promise((resolve) => setTimeout(resolve, DISCOVERY_TIMEOUT_MS))]);
 		} catch {
 			// Discovery interrupted — keep what we have
 		}
@@ -807,6 +814,7 @@ export class FleetSelectorComponent extends Container implements Focusable {
 	private setLoading(text: string): void {
 		this.isLoading = true;
 		this.statusText = text;
+		this.rebuildChildren();
 	}
 
 	private clearLoading(): void {
