@@ -563,12 +563,42 @@ export async function setupGitHubActions(
 		}
 	}
 
-	// 4. Offer: create new repo (public or private), or use existing
-	const choice = await prompt.choose("GitHub Actions needs a dedicated repo for agent runs. What do you want to do?", [
+	// 4. Offer: create new repo, pick from existing repos, or enter name
+	// Fetch user's repos for the picker
+	let userRepos: { name: string; visibility: string; permission: string }[] = [];
+	try {
+		prompt.status("Fetching your GitHub repos...");
+		const reposJson = execSync(
+			'gh repo list --limit 30 --json nameWithOwner,visibility,viewerPermission --jq \'.[] | .nameWithOwner + "," + .visibility + "," + .viewerPermission\'',
+			{ encoding: "utf-8", stdio: ["pipe", "pipe", "pipe"] },
+		);
+		userRepos = reposJson
+			.trim()
+			.split("\n")
+			.filter(Boolean)
+			.map((line) => {
+				const [name, visibility, permission] = line.split(",");
+				return { name, visibility, permission };
+			})
+			.filter((r) => r.permission === "ADMIN" || r.permission === "WRITE" || r.permission === "MAINTAIN");
+	} catch {
+		// gh repo list failed — skip the picker, fall back to manual entry
+	}
+
+	const options = [
 		"Create a new public repo (unlimited Actions compute)",
 		"Create a new private repo (limited but hidden)",
-		"Use an existing repo (enter name)",
-	]);
+	];
+	const repoOffset = options.length; // index where repo list starts
+	for (const r of userRepos) {
+		options.push(`Use existing: ${r.name} (${r.visibility})`);
+	}
+	options.push("Use an existing repo (enter name manually)");
+
+	const choice = await prompt.choose(
+		"GitHub Actions needs a dedicated repo for agent runs. What do you want to do?",
+		options,
+	);
 
 	if (choice === 0 || choice === 1) {
 		// Create new repo
@@ -614,8 +644,47 @@ export async function setupGitHubActions(
 			message: `Created ${isPublic ? "public" : "private"} repo ${fullRepo} for GitHub Actions runs`,
 			config: newConfig,
 		};
-	} else if (choice === 2) {
-		// Use existing repo
+	} else if (choice >= repoOffset && choice < repoOffset + userRepos.length) {
+		// Picked from the user's repo list
+		const pickedRepo = userRepos[choice - repoOffset];
+		const repoInput = pickedRepo.name;
+
+		// Verify access (re-check even though we filtered)
+		prompt.status(`Checking repo ${repoInput}...`);
+		try {
+			const resp = execSync(`gh repo view ${repoInput} --json name,visibility,viewerPermission`, {
+				encoding: "utf-8",
+				stdio: ["pipe", "pipe", "pipe"],
+			});
+			const info = JSON.parse(resp) as { visibility: string; viewerPermission: string };
+			if (info.viewerPermission === "READ" || info.viewerPermission === "TRIAGE") {
+				return {
+					success: false,
+					message: `No write access to ${repoInput}. Choose a repo you own or have admin access to.`,
+				};
+			}
+			if (info.visibility === "PUBLIC") {
+				const confirmPublic = await prompt.confirm(
+					`${repoInput} is public. Public repos have unlimited Actions runs but anyone can see workflow files. Continue?`,
+					false,
+				);
+				if (!confirmPublic) {
+					return { success: false, message: "Setup cancelled" };
+				}
+			}
+		} catch {
+			return { success: false, message: `Could not access repo ${repoInput}. Check the name and your access.` };
+		}
+
+		newConfig.repo = repoInput;
+		newConfig.token = token;
+		return {
+			success: true,
+			message: `GitHub Actions runtime configured with repo: ${repoInput} (${pickedRepo.visibility})`,
+			config: newConfig,
+		};
+	} else {
+		// Manual entry (last option)
 		const repoInput = await prompt.ask("Enter repo (owner/name):");
 		if (!repoInput) {
 			return { success: false, message: "Setup cancelled" };
@@ -656,6 +725,4 @@ export async function setupGitHubActions(
 			config: newConfig,
 		};
 	}
-
-	return { success: false, message: "Setup cancelled" };
 }
