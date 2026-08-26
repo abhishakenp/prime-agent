@@ -683,24 +683,9 @@ export class FleetSelectorComponent extends Container implements Focusable {
 			// gh auth login) work with proper terminal I/O
 			const result = await this.runInteractiveSetup(pluginPath);
 
-			// Show result before returning to TUI
-			console.log(`\n${result.success ? "✓" : "✗"} ${result.message}`);
-			console.log("\nPress Enter to return to fleet manager...");
-
-			// Wait for keypress before restoring TUI
-			await new Promise<void>((resolve) => {
-				const stdin = process.stdin;
-				const handler = () => {
-					stdin.removeListener("data", handler);
-					stdin.pause();
-					resolve();
-				};
-				stdin.once("data", handler);
-				stdin.resume();
-			});
-
+			// runInteractiveSetup already showed result + waited for Enter
+			// and restored the TUI (alt screen + raw mode + listeners)
 			this.clearLoading();
-
 			if (result.success && result.config) {
 				savePluginConfig(transport, result.config);
 				const { updateFleetMemberConfig } = await import("../../../cli/fleet/fleet-config.js");
@@ -734,9 +719,12 @@ export class FleetSelectorComponent extends Container implements Focusable {
 	}> {
 		const { createInterface } = await import("node:readline");
 
-		// Suspend TUI — remove all stdin data listeners and exit raw mode
-		// so readline and child processes (wrangler login, gh auth login)
-		// get proper terminal I/O
+		// Suspend TUI completely:
+		// 1. Remove all stdin data listeners (TUI's input handler)
+		// 2. Exit raw mode so readline + child processes get proper terminal I/O
+		// 3. Leave alt screen so setup output goes to the main terminal buffer
+		//    (child processes like `gh auth login --web` need the real terminal,
+		//    not the alt screen buffer)
 		const stdin = process.stdin;
 
 		// Save and remove all existing data listeners (TUI's input handler)
@@ -749,8 +737,12 @@ export class FleetSelectorComponent extends Container implements Focusable {
 			stdin.setRawMode(false);
 		}
 
-		// Clear screen artifacts, print separator
-		process.stdout.write("\n\n--- Setup ---\n\n");
+		// Leave alt screen — setup runs in the main terminal buffer
+		process.stdout.write("\x1b[?1049l");
+
+		// Clear screen + print separator
+		process.stdout.write("\x1b[2J\x1b[H");
+		process.stdout.write("--- Setup ---\n\n");
 
 		const rl = createInterface({ input: stdin, output: process.stdout });
 
@@ -793,10 +785,30 @@ export class FleetSelectorComponent extends Container implements Focusable {
 		try {
 			const result = await runPluginSetupWithPath(pluginPath, prompt);
 			rl.close();
+
+			// Show result + wait for Enter BEFORE restoring TUI
+			// (we're still in main buffer, not raw mode — readline just closed)
+			process.stdout.write(`\n${result.success ? "✓" : "✗"} ${result.message}\n`);
+			process.stdout.write("\nPress Enter to return to fleet manager...\n");
+
+			await new Promise<void>((resolve) => {
+				const handler = () => {
+					stdin.removeListener("data", handler);
+					stdin.pause();
+					resolve();
+				};
+				stdin.once("data", handler);
+				stdin.resume();
+			});
+
 			return result;
 		} finally {
-			// Restore TUI: re-attach listeners and raw mode
+			// Restore TUI: re-enter alt screen, re-attach listeners, raw mode
 			stdin.pause();
+			// Re-enter alt screen for clean TUI rendering
+			process.stdout.write("\x1b[?1049h");
+			// Clear the alt screen buffer
+			process.stdout.write("\x1b[2J\x1b[H");
 			for (const listener of originalListeners) {
 				stdin.on("data", listener);
 			}
@@ -804,8 +816,8 @@ export class FleetSelectorComponent extends Container implements Focusable {
 				stdin.setRawMode(true);
 			}
 			stdin.resume();
-			// Re-render TUI
-			this.rebuildChildren();
+			// Force full re-render
+			this.requestRender();
 		}
 	}
 
