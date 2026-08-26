@@ -391,7 +391,9 @@ export class FleetSelectorComponent extends Container implements Focusable {
 		const total = this.entries.length;
 		const online = this.entries.filter((e) => e.online).length;
 		const fleet = this.entries.filter((e) => e.inFleet).length;
-		return `${theme.fg("dim", `  ${total} devices · ${online} online · ${fleet} in fleet`)}  ${theme.fg("dim", "Enter add/remove · / search · r reconfigure · Ctrl+R rename · Ctrl+T tag · q quit")}`;
+		const selected = this.filteredEntries[this.cursorIndex];
+		const rHint = selected?.isCloud ? "r reconfigure" : "r refresh";
+		return `${theme.fg("dim", `  ${total} devices · ${online} online · ${fleet} in fleet`)}  ${theme.fg("dim", `Enter add/remove · / search · ${rHint} · Ctrl+R rename · Ctrl+T tag · q quit`)}`;
 	}
 
 	// ─── Keyboard ─────────────────────────────────────────────────────
