@@ -246,9 +246,12 @@ export class FleetSelectorComponent extends Container implements Focusable {
 		} else {
 			this.filteredEntries = fuzzyFilter(this.entries, query, (e) => e.hostname);
 		}
+		// Sort must match renderGroupedList order exactly:
+		// FLEET → AVAILABLE RUNTIMES → ONLINE → OFFLINE
 		this.filteredEntries.sort((a, b) => {
-			if (a.inFleet !== b.inFleet) return a.inFleet ? -1 : 1;
-			if (a.online !== b.online) return a.online ? -1 : 1;
+			const aGroup = a.inFleet ? 0 : a.isTemplate ? 1 : a.online ? 2 : 3;
+			const bGroup = b.inFleet ? 0 : b.isTemplate ? 1 : b.online ? 2 : 3;
+			if (aGroup !== bGroup) return aGroup - bGroup;
 			return a.hostname.localeCompare(b.hostname);
 		});
 		if (this.cursorIndex >= this.filteredEntries.length) {
