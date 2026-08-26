@@ -30,24 +30,15 @@ import {
 	importRuntimeMembers,
 	listFleetHosts,
 	listFleetMembers,
+	removeFleetMember,
 } from "../../../cli/fleet/fleet-config.js";
-import {
-	addHostToFleet,
-	bootstrapFleetHost,
-	checkFleetHostStatus,
-	connectFleetHost,
-	disconnectFleetHost,
-	removeHostFromFleet,
-	renameHostInFleet,
-	sshIntoFleetHost,
-	tagHostInFleet,
-} from "../../../cli/fleet/fleet-operations.js";
+import { addHostToFleet, renameHostInFleet, tagHostInFleet } from "../../../cli/fleet/fleet-operations.js";
 import { installRuntimePlugin, listRuntimePlugins } from "../../../cli/fleet/runtime-operations.js";
 import { theme } from "../theme/theme.js";
 import { DynamicBorder } from "./dynamic-border.js";
 import { shouldTreatAsBack } from "./modal-back.js";
 
-type FleetView = "main" | "host-actions";
+type FleetView = "main";
 
 interface FleetEntry {
 	hostname: string;
@@ -282,12 +273,10 @@ export class FleetSelectorComponent extends Container implements Focusable {
 			this.addChild(new Text(theme.fg("dim", "  Type and press Enter · Esc to cancel"), 1, 0));
 		} else if (this.isLoading) {
 			this.addChild(new Text(theme.fg("dim", `  ${this.statusText}`), 1, 0));
-		} else if (this.filteredEntries.length === 0 && this.currentView === "main") {
+		} else if (this.filteredEntries.length === 0) {
 			this.addChild(new Text(theme.fg("dim", "  No devices found"), 1, 0));
-		} else if (this.currentView === "main") {
-			this.renderGroupedList();
 		} else {
-			this.renderHostActions();
+			this.renderGroupedList();
 		}
 
 		this.addChild(new Spacer(1));
@@ -392,52 +381,11 @@ export class FleetSelectorComponent extends Container implements Focusable {
 		return parts.length > 0 ? parts.join(" ") : "";
 	}
 
-	private renderHostActions(): void {
-		const entry = this.selectedEntry;
-		if (!entry) return;
-
-		// SSH host only — cloud members never reach this view
-		const displayName = entry.fleetHost?.displayName ?? entry.hostname;
-		this.addChild(new Text(theme.fg("accent", ` ${displayName}`), 1, 0));
-		this.addChild(new Text(theme.fg("dim", ` ${entry.address} · ${entry.os ?? "?"}`), 1, 0));
-		this.addChild(new Spacer(1));
-
-		const actions: { key: string; label: string; desc: string }[] = [
-			{ key: "s", label: "Check status", desc: "Probe SSH, pi, daemon" },
-			{
-				key: "b",
-				label: "Bootstrap",
-				desc: entry.piVersion ? `Pi ${entry.piVersion} installed` : "Install pi + start daemon",
-			},
-			{ key: "c", label: "Connect", desc: "Mark as connected" },
-			{ key: "d", label: "Disconnect", desc: "Stop daemon on host" },
-			{ key: "e", label: "SSH", desc: "Open SSH session" },
-		];
-		if (entry.inFleet) {
-			actions.push({ key: "n", label: "Rename", desc: "Set custom display name" });
-			actions.push({ key: "t", label: "Add tag", desc: "Tag this host" });
-			actions.push({ key: "x", label: "Remove from fleet", desc: "Unregister this host" });
-		} else {
-			actions.push({ key: "a", label: "Add to fleet", desc: `Tags: ${entry.tags.join(", ")}` });
-		}
-
-		for (const action of actions) {
-			this.addChild(
-				new Text(`  ${theme.fg("accent", action.key)}  ${action.label}  ${theme.fg("dim", action.desc)}`, 1, 0),
-			);
-		}
-		this.addChild(new Spacer(1));
-		this.addChild(new Text(theme.fg("dim", "  Press key to execute · esc to go back"), 1, 0));
-	}
-
 	private getStatusLine(): string {
-		if (this.currentView === "host-actions") {
-			return theme.fg("dim", "  Action mode · esc to go back");
-		}
 		const total = this.entries.length;
 		const online = this.entries.filter((e) => e.online).length;
 		const fleet = this.entries.filter((e) => e.inFleet).length;
-		return `${theme.fg("dim", `  ${total} devices · ${online} online · ${fleet} in fleet`)}  ${theme.fg("dim", "Enter actions · / search · r reconfigure runtime · Ctrl+R rename · Ctrl+T tag · q quit")}`;
+		return `${theme.fg("dim", `  ${total} devices · ${online} online · ${fleet} in fleet`)}  ${theme.fg("dim", "Enter actions · / search · r reconfigure · Ctrl+R rename · Ctrl+T tag · q quit")}`;
 	}
 
 	// ─── Keyboard ─────────────────────────────────────────────────────
@@ -466,11 +414,6 @@ export class FleetSelectorComponent extends Container implements Focusable {
 			}
 			this.searchInput.handleInput(data);
 			this.rebuildChildren();
-			return;
-		}
-
-		if (this.currentView === "host-actions") {
-			this.handleHostActionsInput(data);
 			return;
 		}
 
@@ -571,16 +514,24 @@ export class FleetSelectorComponent extends Container implements Focusable {
 			return;
 		}
 
-		// Cloud member with config → toggle active/inactive (no submenu)
+		// Cloud member with config → toggle active/inactive
 		if (entry.isCloud && entry.inFleet && entry.hasConfig) {
 			await this.toggleCloudMember(entry);
 			return;
 		}
 
-		// SSH host → host-actions submenu
-		this.currentView = "host-actions";
-		this.selectedEntry = entry;
-		this.rebuildChildren();
+		// SSH host not in fleet → add to fleet
+		if (!entry.inFleet) {
+			const result = await addHostToFleet(entry.hostname, entry.address, entry.tags, entry.device);
+			this.statusText = result.success ? `✓ ${result.message}` : `✗ ${result.message}`;
+			await this.autoDiscover();
+			return;
+		}
+
+		// SSH host in fleet → remove from fleet
+		const removed = await removeFleetMember(entry.hostname);
+		this.statusText = removed ? `✓ Removed ${entry.hostname}` : `✗ Failed to remove`;
+		await this.autoDiscover();
 	}
 
 	private async toggleCloudMember(entry: FleetEntry): Promise<void> {
@@ -629,49 +580,6 @@ export class FleetSelectorComponent extends Container implements Focusable {
 		await this.autoDiscover();
 	}
 
-	private handleHostActionsInput(data: string): void {
-		const kb = getKeybindings();
-		if (kb.matches(data, "tui.select.cancel")) {
-			this.currentView = "main";
-			this.selectedEntry = null;
-			this.rebuildChildren();
-			return;
-		}
-		const entry = this.selectedEntry;
-		if (!entry) return;
-
-		// SSH host actions only — cloud members never reach this view
-		switch (data) {
-			case "s":
-				void this.hostAction("status");
-				break;
-			case "b":
-				void this.hostAction("bootstrap");
-				break;
-			case "c":
-				void this.hostAction("connect");
-				break;
-			case "d":
-				void this.hostAction("disconnect");
-				break;
-			case "x":
-				void this.hostAction("remove");
-				break;
-			case "a":
-				void this.hostAction("add");
-				break;
-			case "n":
-				void this.hostAction("rename");
-				break;
-			case "t":
-				void this.hostAction("tag");
-				break;
-			case "e":
-				void this.hostAction("ssh");
-				break;
-		}
-	}
-
 	private async confirmRename(newName: string): Promise<void> {
 		const hostname = this._renameTarget;
 		this._renaming = false;
@@ -695,103 +603,6 @@ export class FleetSelectorComponent extends Container implements Focusable {
 	}
 
 	// ─── Actions — all delegate to fleet-operations.ts ────────────────
-
-	private async hostAction(action: string): Promise<void> {
-		const entry = this.selectedEntry;
-		if (!entry) return;
-
-		switch (action) {
-			case "status": {
-				this.setLoading(`Probing ${entry.hostname}...`);
-				const result = await checkFleetHostStatus(entry.hostname);
-				this.clearLoading();
-				this.statusText = result.success ? result.message : `✗ ${result.message}`;
-				if (entry.fleetHost && result.piVersion) entry.fleetHost.piVersion = result.piVersion;
-				this.rebuildChildren();
-				break;
-			}
-			case "bootstrap": {
-				this.setLoading(`Bootstrapping ${entry.hostname}...`);
-				const result = await bootstrapFleetHost(entry.hostname, entry.address, entry.tags);
-				this.clearLoading();
-				this.statusText = result.success ? `✓ ${result.message}` : `✗ ${result.message}`;
-				this.currentView = "main";
-				this.selectedEntry = null;
-				await this.autoDiscover();
-				break;
-			}
-			case "connect": {
-				if (entry.inFleet) {
-					const result = await connectFleetHost(entry.hostname);
-					this.statusText = result.success ? `✓ ${result.message}` : `✗ ${result.message}`;
-				}
-				this.currentView = "main";
-				this.selectedEntry = null;
-				this.rebuildChildren();
-				break;
-			}
-			case "disconnect": {
-				this.setLoading(`Disconnecting ${entry.hostname}...`);
-				const result = await disconnectFleetHost(entry.hostname);
-				this.clearLoading();
-				this.statusText = result.success ? `✓ ${result.message}` : `✗ ${result.message}`;
-				this.currentView = "main";
-				this.selectedEntry = null;
-				this.rebuildChildren();
-				break;
-			}
-			case "remove": {
-				const result = await removeHostFromFleet(entry.hostname);
-				this.statusText = result.success ? `✓ ${result.message}` : `✗ ${result.message}`;
-				this.currentView = "main";
-				this.selectedEntry = null;
-				await this.autoDiscover();
-				break;
-			}
-			case "add": {
-				const result = await addHostToFleet(entry.hostname, entry.address, entry.tags, entry.device);
-				this.statusText = result.success ? `✓ ${result.message}` : `✗ ${result.message}`;
-				this.currentView = "main";
-				this.selectedEntry = null;
-				await this.autoDiscover();
-				break;
-			}
-			case "rename": {
-				if (!entry.inFleet) {
-					this.statusText = `Add ${entry.hostname} to fleet first to rename`;
-					this.rebuildChildren();
-					break;
-				}
-				this.searchInput.setValue("");
-				this.statusText = `Enter new name for ${entry.hostname} (Enter to confirm, Esc to cancel):`;
-				this._renameTarget = entry.hostname;
-				this._renaming = true;
-				this.rebuildChildren();
-				break;
-			}
-			case "tag": {
-				if (!entry.inFleet) {
-					this.statusText = `Add ${entry.hostname} to fleet first to tag`;
-					this.rebuildChildren();
-					break;
-				}
-				this.searchInput.setValue("");
-				this.statusText = `Enter tag for ${entry.hostname} (Enter to add, Esc to cancel):`;
-				this._tagTarget = entry.hostname;
-				this._tagging = true;
-				this.rebuildChildren();
-				break;
-			}
-			case "ssh": {
-				this.statusText = `SSH to ${entry.address}...`;
-				this.rebuildChildren();
-				await sshIntoFleetHost(entry.hostname);
-				this.statusText = `SSH session ended`;
-				this.rebuildChildren();
-				break;
-			}
-		}
-	}
 
 	private async cloudAction(action: string): Promise<void> {
 		const entry = this.selectedEntry;
