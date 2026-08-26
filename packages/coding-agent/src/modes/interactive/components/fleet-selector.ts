@@ -11,7 +11,6 @@
  * All business logic delegates to fleet-operations.ts.
  */
 
-import { createRequire } from "node:module";
 import {
 	Container,
 	type Focusable,
@@ -27,6 +26,7 @@ import {
 import { type DiscoveredDevice, discoverStream, inferTags } from "../../../cli/fleet/discovery.js";
 import {
 	type FleetHost,
+	type FleetTransport,
 	importRuntimeMembers,
 	listFleetHosts,
 	listFleetMembers,
@@ -42,21 +42,12 @@ import {
 	sshIntoFleetHost,
 	tagHostInFleet,
 } from "../../../cli/fleet/fleet-operations.js";
-import {
-	installRuntimePlugin,
-	listRuntimePlugins,
-	pluginHasSetup,
-	type RuntimePluginInfo,
-	runPluginSetupWithPath,
-	savePluginConfig,
-	toggleRuntimePlugin,
-	uninstallRuntimePlugin,
-} from "../../../cli/fleet/runtime-operations.js";
+import { installRuntimePlugin, listRuntimePlugins } from "../../../cli/fleet/runtime-operations.js";
 import { theme } from "../theme/theme.js";
 import { DynamicBorder } from "./dynamic-border.js";
 import { shouldTreatAsBack } from "./modal-back.js";
 
-type FleetView = "main" | "host-actions" | "runtimes" | "runtime-actions";
+type FleetView = "main" | "host-actions";
 
 interface FleetEntry {
 	hostname: string;
@@ -79,6 +70,8 @@ interface FleetEntry {
 	isCloud?: boolean;
 	/** Whether setup/config is complete. */
 	hasConfig?: boolean;
+	/** Whether this is an available runtime template (not yet added to fleet). */
+	isTemplate?: boolean;
 }
 
 export interface FleetSelectorOptions {
@@ -106,9 +99,6 @@ export class FleetSelectorComponent extends Container implements Focusable {
 	private _tagTarget = "";
 	private _configuring = false;
 	private _configTarget = "";
-	private _runtimePlugins: RuntimePluginInfo[] = [];
-	private _runtimeCursor = 0;
-	private _selectedRuntime: RuntimePluginInfo | null = null;
 	private readonly onDone: () => void;
 	private readonly onCancel: () => void;
 	private readonly requestRender: () => void;
@@ -156,8 +146,10 @@ export class FleetSelectorComponent extends Container implements Focusable {
 
 		// Load cloud members (cloudflare, github-actions, custom)
 		const members = await listFleetMembers();
+		const addedTransports = new Set<string>();
 		for (const m of members) {
 			if (m.transport === "ssh") continue; // Already in fleetHosts
+			addedTransports.add(m.transport);
 			const existing = this.entries.find((e) => e.hostname === m.name);
 			if (existing) {
 				existing.transport = m.transport;
@@ -182,6 +174,28 @@ export class FleetSelectorComponent extends Container implements Focusable {
 				});
 			}
 		}
+
+		// Add available runtime templates (not yet added to fleet)
+		const plugins = await listRuntimePlugins();
+		for (const p of plugins) {
+			if (p.source === "template" && !addedTransports.has(p.name)) {
+				this.entries.push({
+					hostname: p.name,
+					address: "not configured",
+					tags: ["available"],
+					source: "discovered",
+					online: false,
+					sshable: false,
+					hasPi: false,
+					inFleet: false,
+					transport: p.name,
+					isCloud: true,
+					isTemplate: true,
+					hasConfig: false,
+				});
+			}
+		}
+
 		this.applyFilter();
 
 		try {
@@ -264,17 +278,13 @@ export class FleetSelectorComponent extends Container implements Focusable {
 		this.addChild(new Spacer(1));
 
 		// Device list with group headers
-		if (this._renaming || this._tagging) {
+		if (this._renaming || this._tagging || this._configuring) {
 			this.addChild(new Text(theme.fg("accent", `  ${this.statusText}`), 1, 0));
 			this.addChild(new Spacer(1));
 			this.addChild(new Text(theme.fg("dim", "  Type and press Enter · Esc to cancel"), 1, 0));
-		} else if (this.isLoading && this.currentView !== "runtimes" && this.currentView !== "runtime-actions") {
+		} else if (this.isLoading) {
 			this.addChild(new Text(theme.fg("dim", `  ${this.statusText}`), 1, 0));
-		} else if (this.currentView === "runtimes") {
-			this.renderRuntimesList();
-		} else if (this.currentView === "runtime-actions") {
-			this.renderRuntimeActions();
-		} else if (this.filteredEntries.length === 0) {
+		} else if (this.filteredEntries.length === 0 && this.currentView === "main") {
 			this.addChild(new Text(theme.fg("dim", "  No devices found"), 1, 0));
 		} else if (this.currentView === "main") {
 			this.renderGroupedList();
@@ -290,14 +300,24 @@ export class FleetSelectorComponent extends Container implements Focusable {
 
 	private renderGroupedList(): void {
 		const fleetItems = this.filteredEntries.filter((e) => e.inFleet);
-		const onlineItems = this.filteredEntries.filter((e) => !e.inFleet && e.online);
-		const offlineItems = this.filteredEntries.filter((e) => !e.inFleet && !e.online);
+		const templateItems = this.filteredEntries.filter((e) => e.isTemplate);
+		const onlineItems = this.filteredEntries.filter((e) => !e.inFleet && !e.isTemplate && e.online);
+		const offlineItems = this.filteredEntries.filter((e) => !e.inFleet && !e.isTemplate && !e.online);
 
 		let virtualIndex = 0;
 
 		if (fleetItems.length > 0) {
 			this.addChild(new Text(theme.fg("accent", theme.bold(` FLEET (${fleetItems.length})`)), 1, 0));
 			for (const entry of fleetItems) {
+				this.addDeviceRow(entry, virtualIndex);
+				virtualIndex++;
+			}
+			this.addChild(new Spacer(1));
+		}
+
+		if (templateItems.length > 0) {
+			this.addChild(new Text(theme.fg("dim", theme.bold(` AVAILABLE RUNTIMES (${templateItems.length})`)), 1, 0));
+			for (const entry of templateItems) {
 				this.addDeviceRow(entry, virtualIndex);
 				virtualIndex++;
 			}
@@ -328,14 +348,19 @@ export class FleetSelectorComponent extends Container implements Focusable {
 		const isSelected = virtualIndex === this.cursorIndex;
 
 		const displayName = entry.fleetHost?.displayName ?? entry.hostname;
-		const hostnameColor = entry.inFleet ? "accent" : entry.online ? "text" : "dim";
+		const hostnameColor = entry.isTemplate ? "dim" : entry.inFleet ? "accent" : entry.online ? "text" : "dim";
 		const hostname = theme.fg(hostnameColor, truncateToWidth(displayName, 22, ""));
-		const transportBadge = entry.isCloud
-			? theme.fg("accent", (entry.transport ?? "cloud").padEnd(7))
-			: entry.os
-				? this.formatOsBadge(entry.os)
-				: "";
-		const badges = this.formatBadges(entry);
+		let transportBadge: string;
+		if (entry.isTemplate) {
+			transportBadge = theme.fg("dim", (entry.transport ?? "runtime").padEnd(7));
+		} else if (entry.isCloud) {
+			transportBadge = theme.fg("accent", (entry.transport ?? "cloud").padEnd(7));
+		} else if (entry.os) {
+			transportBadge = this.formatOsBadge(entry.os);
+		} else {
+			transportBadge = "";
+		}
+		const badges = entry.isTemplate ? theme.fg("dim", "○ add") : this.formatBadges(entry);
 		const prefix = isSelected ? theme.fg("accent", "›") : " ";
 
 		const padding = " ".repeat(Math.max(1, 27 - visibleWidth(displayName)));
@@ -446,136 +471,14 @@ export class FleetSelectorComponent extends Container implements Focusable {
 		this.addChild(new Text(theme.fg("dim", "  Press key to execute · esc to go back"), 1, 0));
 	}
 
-	// ─── Runtimes view ──────────────────────────────────────────────
-
-	private renderRuntimesList(): void {
-		if (this._runtimePlugins.length === 0) {
-			this.addChild(new Text(theme.fg("dim", "  No runtime plugins found"), 1, 0));
-			this.addChild(new Spacer(1));
-			this.addChild(
-				new Text(
-					theme.fg("dim", "  Built-in: SSH only. Install templates with 'fleet runtimes install <name>'"),
-					1,
-					0,
-				),
-			);
-			return;
-		}
-
-		const builtin = this._runtimePlugins.filter((p) => p.source === "builtin");
-		const user = this._runtimePlugins.filter((p) => p.source === "user");
-		const templates = this._runtimePlugins.filter((p) => p.source === "template");
-
-		let virtualIndex = 0;
-
-		if (builtin.length > 0) {
-			this.addChild(new Text(theme.fg("accent", theme.bold(` BUILT-IN (${builtin.length})`)), 1, 0));
-			for (const plugin of builtin) {
-				this.addRuntimeRow(plugin, virtualIndex);
-				virtualIndex++;
-			}
-			this.addChild(new Spacer(1));
-		}
-
-		if (user.length > 0) {
-			this.addChild(new Text(theme.fg("success", theme.bold(` USER INSTALLED (${user.length})`)), 1, 0));
-			for (const plugin of user) {
-				this.addRuntimeRow(plugin, virtualIndex);
-				virtualIndex++;
-			}
-		}
-
-		if (templates.length > 0) {
-			if (user.length > 0 || builtin.length > 0) this.addChild(new Spacer(1));
-			this.addChild(new Text(theme.fg("dim", theme.bold(` AVAILABLE TEMPLATES (${templates.length})`)), 1, 0));
-			for (const plugin of templates) {
-				this.addRuntimeRow(plugin, virtualIndex);
-				virtualIndex++;
-			}
-		}
-
-		if (this.statusText) {
-			this.addChild(new Spacer(1));
-			this.addChild(new Text(theme.fg("accent", `  ${this.statusText}`), 1, 0));
-		}
-	}
-
-	private addRuntimeRow(plugin: RuntimePluginInfo, virtualIndex: number): void {
-		const isSelected = virtualIndex === this._runtimeCursor;
-		const prefix = isSelected ? theme.fg("accent", "›") : " ";
-
-		let statusIcon: string;
-		let statusColor: "dim" | "success" | "warning";
-		if (plugin.source === "template") {
-			statusIcon = "○";
-			statusColor = "dim";
-		} else if (plugin.active) {
-			statusIcon = "●";
-			statusColor = "success";
-		} else {
-			statusIcon = "○";
-			statusColor = "warning";
-		}
-
-		const nameColor: "accent" | "success" | "dim" =
-			plugin.source === "builtin" ? "accent" : plugin.source === "user" ? "success" : "dim";
-		const name = theme.fg(nameColor, plugin.name.padEnd(18));
-		const status = theme.fg(statusColor, statusIcon);
-		const source = theme.fg("dim", plugin.source.padEnd(10));
-		const config = plugin.hasConfig ? theme.fg("success", "cfg") : theme.fg("dim", "   ");
-		const size = theme.fg("dim", `${(plugin.size / 1024).toFixed(0)}KB`.padEnd(8));
-
-		this.addChild(new Text(` ${prefix} ${status} ${name}${source}${config} ${size}`, 1, 0));
-	}
-
-	private renderRuntimeActions(): void {
-		const plugin = this._selectedRuntime;
-		if (!plugin) return;
-
-		this.addChild(new Text(theme.fg("accent", ` ${plugin.name}`), 1, 0));
-		this.addChild(new Text(theme.fg("dim", ` ${plugin.source} · ${plugin.path}`), 1, 0));
-		this.addChild(new Spacer(1));
-
-		const actions: { key: string; label: string; desc: string }[] = [];
-
-		if (plugin.source === "template") {
-			actions.push({ key: "i", label: "Install + Setup", desc: "Copy to ~/.prime/runtimes/ and configure" });
-		} else if (plugin.source === "user") {
-			actions.push({ key: "s", label: "Reconfigure", desc: "Run setup again (login, repo, etc.)" });
-			if (plugin.active) {
-				actions.push({ key: "d", label: "Disable", desc: "Disable this plugin" });
-			} else {
-				actions.push({ key: "e", label: "Enable", desc: "Enable this plugin" });
-			}
-			actions.push({ key: "x", label: "Uninstall", desc: "Remove from ~/.prime/runtimes/" });
-		} else if (plugin.source === "builtin") {
-			actions.push({ key: "i", label: "Override", desc: "Copy as user plugin to customize" });
-		}
-
-		for (const action of actions) {
-			this.addChild(
-				new Text(`  ${theme.fg("accent", action.key)}  ${action.label}  ${theme.fg("dim", action.desc)}`, 1, 0),
-			);
-		}
-
-		this.addChild(new Spacer(1));
-		this.addChild(new Text(theme.fg("dim", "  Press key to execute · esc to go back"), 1, 0));
-	}
-
 	private getStatusLine(): string {
 		if (this.currentView === "host-actions") {
 			return theme.fg("dim", "  Action mode · esc to go back");
 		}
-		if (this.currentView === "runtimes") {
-			return theme.fg("dim", "  ↑↓ navigate · Enter actions · R refresh · esc back · q quit");
-		}
-		if (this.currentView === "runtime-actions") {
-			return theme.fg("dim", "  Runtime actions · esc to go back");
-		}
 		const total = this.entries.length;
 		const online = this.entries.filter((e) => e.online).length;
 		const fleet = this.entries.filter((e) => e.inFleet).length;
-		return `${theme.fg("dim", `  ${total} devices · ${online} online · ${fleet} in fleet`)}  ${theme.fg("dim", "Enter actions · / search · Ctrl+R rename · Ctrl+T tag · P runtimes · q quit")}`;
+		return `${theme.fg("dim", `  ${total} devices · ${online} online · ${fleet} in fleet`)}  ${theme.fg("dim", "Enter actions · / search · r reconfigure runtime · Ctrl+R rename · Ctrl+T tag · q quit")}`;
 	}
 
 	// ─── Keyboard ─────────────────────────────────────────────────────
@@ -615,29 +518,21 @@ export class FleetSelectorComponent extends Container implements Focusable {
 			return;
 		}
 
-		if (this.currentView === "runtimes") {
-			this.handleRuntimesInput(data);
-			return;
-		}
-
-		if (this.currentView === "runtime-actions") {
-			this.handleRuntimeActionsInput(data);
-			return;
-		}
-
 		if (data === "q" && this.searchInput.getValue() === "") {
 			this.onDone();
 			return;
 		}
 
 		if (data === "r" && this.searchInput.getValue() === "") {
+			// r on active cloud member → reconfigure (run setup)
+			const entry = this.filteredEntries[this.cursorIndex];
+			if (entry && entry.isCloud && entry.inFleet && entry.hasConfig) {
+				this.selectedEntry = entry;
+				void this.cloudAction("setup");
+				return;
+			}
+			// Otherwise → refresh
 			void this.autoDiscover();
-			return;
-		}
-
-		// P — open runtimes management view
-		if (data === "P" && this.searchInput.getValue() === "") {
-			void this.openRuntimesView();
 			return;
 		}
 
@@ -705,11 +600,59 @@ export class FleetSelectorComponent extends Container implements Focusable {
 
 	private async handleEnter(): Promise<void> {
 		const entry = this.filteredEntries[this.cursorIndex];
-		if (entry) {
-			this.currentView = "host-actions";
-			this.selectedEntry = entry;
-			this.rebuildChildren();
+		if (!entry) return;
+
+		// Runtime template → add + auto-setup
+		if (entry.isTemplate) {
+			await this.addAndSetupRuntime(entry);
+			return;
 		}
+
+		// Cloud member without config → auto-setup
+		if (entry.isCloud && entry.inFleet && !entry.hasConfig) {
+			this.selectedEntry = entry;
+			await this.cloudAction("setup");
+			return;
+		}
+
+		// SSH host or configured cloud member → host-actions submenu
+		this.currentView = "host-actions";
+		this.selectedEntry = entry;
+		this.rebuildChildren();
+	}
+
+	private async addAndSetupRuntime(entry: FleetEntry): Promise<void> {
+		const transport = entry.transport ?? entry.hostname;
+		this.setLoading(`Adding ${transport}...`);
+
+		// Install the plugin
+		const result = installRuntimePlugin(transport);
+		if (!result.success) {
+			this.clearLoading();
+			this.statusText = `✗ ${result.message}`;
+			this.rebuildChildren();
+			return;
+		}
+
+		// Add as fleet member
+		const { addFleetMember } = await import("../../../cli/fleet/fleet-config.js");
+		await addFleetMember({
+			name: transport,
+			transport: transport as FleetTransport,
+			tags: ["cloud", transport],
+			addedAt: Date.now(),
+			lastStatus: "inactive",
+			enabled: true,
+		});
+
+		this.clearLoading();
+
+		// Auto-run setup
+		this.selectedEntry = { ...entry, inFleet: true, isTemplate: false };
+		await this.cloudAction("setup");
+
+		// Refresh list
+		await this.autoDiscover();
 	}
 
 	private handleHostActionsInput(data: string): void {
@@ -775,205 +718,6 @@ export class FleetSelectorComponent extends Container implements Focusable {
 				void this.hostAction("ssh");
 				break;
 		}
-	}
-
-	// ─── Runtimes keyboard ──────────────────────────────────────────
-
-	private async openRuntimesView(): Promise<void> {
-		this.currentView = "runtimes";
-		this.statusText = "Loading runtime plugins...";
-		this.rebuildChildren();
-		this._runtimePlugins = await listRuntimePlugins();
-		this._runtimeCursor = 0;
-		this.statusText = "";
-		this.rebuildChildren();
-	}
-
-	private handleRuntimesInput(data: string): void {
-		const kb = getKeybindings();
-
-		if (kb.matches(data, "tui.select.cancel") || data === "q") {
-			this.currentView = "main";
-			this.statusText = "";
-			this.rebuildChildren();
-			return;
-		}
-
-		if (data === "R") {
-			void this.openRuntimesView();
-			return;
-		}
-
-		if (kb.matches(data, "tui.select.up")) {
-			this._runtimeCursor = this._runtimeCursor === 0 ? this._runtimePlugins.length - 1 : this._runtimeCursor - 1;
-			this.rebuildChildren();
-			return;
-		}
-		if (kb.matches(data, "tui.select.down")) {
-			this._runtimeCursor = this._runtimeCursor === this._runtimePlugins.length - 1 ? 0 : this._runtimeCursor + 1;
-			this.rebuildChildren();
-			return;
-		}
-
-		if (kb.matches(data, "tui.select.confirm")) {
-			const plugin = this._runtimePlugins[this._runtimeCursor];
-			if (plugin) {
-				this._selectedRuntime = plugin;
-				this.currentView = "runtime-actions";
-				this.rebuildChildren();
-			}
-			return;
-		}
-	}
-
-	private handleRuntimeActionsInput(data: string): void {
-		const kb = getKeybindings();
-		if (kb.matches(data, "tui.select.cancel")) {
-			this.currentView = "runtimes";
-			this._selectedRuntime = null;
-			this.rebuildChildren();
-			return;
-		}
-
-		const plugin = this._selectedRuntime;
-		if (!plugin) return;
-
-		switch (data) {
-			case "i":
-				void this.runtimeAction("install", plugin);
-				break;
-			case "s":
-				void this.runtimeAction("reconfigure", plugin);
-				break;
-			case "e":
-				void this.runtimeAction("enable", plugin);
-				break;
-			case "d":
-				void this.runtimeAction("disable", plugin);
-				break;
-			case "x":
-				void this.runtimeAction("uninstall", plugin);
-				break;
-		}
-	}
-
-	private async runtimeAction(action: string, plugin: RuntimePluginInfo): Promise<void> {
-		switch (action) {
-			case "install": {
-				// Install the plugin file first
-				const result = installRuntimePlugin(plugin.name);
-				if (!result.success) {
-					this.statusText = `✗ ${result.message}`;
-					break;
-				}
-
-				// Check if the installed plugin has a setup() function
-				const { join } = await import("node:path");
-				const { homedir } = await import("node:os");
-				const pluginPath = join(homedir(), ".prime", "runtimes", `${plugin.name}.mjs`);
-				const hasSetup = await pluginHasSetup(pluginPath);
-
-				if (hasSetup) {
-					// Run interactive setup — uses readline for TUI prompts
-					this.statusText = `Setting up ${plugin.name}...`;
-					this.rebuildChildren();
-
-					const setupResult = await runPluginSetupWithPath(pluginPath, this.createSetupPrompt());
-
-					if (setupResult.success && setupResult.config) {
-						savePluginConfig(plugin.name, setupResult.config);
-					}
-					this.statusText = setupResult.success ? `✓ ${setupResult.message}` : `✗ ${setupResult.message}`;
-				} else {
-					this.statusText = `✓ ${result.message}`;
-				}
-				break;
-			}
-			case "enable": {
-				const result = toggleRuntimePlugin(plugin.name, true);
-				this.statusText = result.success ? `✓ ${result.message}` : `✗ ${result.message}`;
-				break;
-			}
-			case "reconfigure": {
-				const { join } = await import("node:path");
-				const { homedir } = await import("node:os");
-				const pluginPath = join(homedir(), ".prime", "runtimes", `${plugin.name}.mjs`);
-				const hasSetup = await pluginHasSetup(pluginPath);
-				if (!hasSetup) {
-					this.statusText = `${plugin.name} has no setup flow`;
-					break;
-				}
-				this.statusText = `Reconfiguring ${plugin.name}...`;
-				this.rebuildChildren();
-				const setupResult = await runPluginSetupWithPath(pluginPath, this.createSetupPrompt());
-				if (setupResult.success && setupResult.config) {
-					savePluginConfig(plugin.name, setupResult.config);
-				}
-				this.statusText = setupResult.success ? `✓ ${setupResult.message}` : `✗ ${setupResult.message}`;
-				break;
-			}
-			case "disable": {
-				const result = toggleRuntimePlugin(plugin.name, false);
-				this.statusText = result.success ? `✓ ${result.message}` : `✗ ${result.message}`;
-				break;
-			}
-			case "uninstall": {
-				const result = uninstallRuntimePlugin(plugin.name);
-				this.statusText = result.success ? `✓ ${result.message}` : `✗ ${result.message}`;
-				break;
-			}
-		}
-
-		this.currentView = "runtimes";
-		this._selectedRuntime = null;
-		this._runtimePlugins = await listRuntimePlugins();
-		this.rebuildChildren();
-	}
-
-	/** Create a SetupPrompt implementation using readline for terminal I/O. */
-	private createSetupPrompt() {
-		const req = createRequire(import.meta.url);
-		const { createInterface } = req("node:readline") as typeof import("node:readline");
-		const rl = createInterface({ input: process.stdin, output: process.stdout });
-
-		const ask = (q: string, def?: string): Promise<string | undefined> =>
-			new Promise((resolve) => {
-				const prompt = def ? `${q} [${def}]: ` : `${q}: `;
-				rl.question(prompt, (answer: string) => {
-					const trimmed = answer.trim();
-					if (!trimmed && def) return resolve(def);
-					resolve(trimmed || undefined);
-				});
-			});
-
-		const confirm = (q: string, def?: boolean): Promise<boolean> =>
-			new Promise((resolve) => {
-				const hint = def ? "Y/n" : "y/N";
-				rl.question(`${q} [${hint}]: `, (answer: string) => {
-					const a = answer.trim().toLowerCase();
-					if (!a) return resolve(def ?? false);
-					resolve(a === "y" || a === "yes");
-				});
-			});
-
-		const choose = (q: string, options: string[]): Promise<number> =>
-			new Promise((resolve) => {
-				console.log(`\n${q}`);
-				options.forEach((opt, i) => {
-					console.log(`  ${i + 1}. ${opt}`);
-				});
-				rl.question(`Choose (1-${options.length}): `, (answer: string) => {
-					const n = Number.parseInt(answer.trim(), 10);
-					if (n >= 1 && n <= options.length) return resolve(n - 1);
-					resolve(-1);
-				});
-			});
-
-		const status = (msg: string) => {
-			console.log(`  ${msg}`);
-		};
-
-		return { ask, confirm, choose, status };
 	}
 
 	private async confirmRename(newName: string): Promise<void> {
