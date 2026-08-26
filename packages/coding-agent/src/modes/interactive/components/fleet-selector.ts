@@ -116,7 +116,9 @@ export class FleetSelectorComponent extends Container implements Focusable {
 		this.isLoading = true;
 		this.statusText = "Discovering networked devices...";
 
-		this.rebuildChildren();
+		// Don't rebuildChildren() here — autoDiscover() will call
+		// applyFilter() → rebuildChildren() once when ready.
+		// Rendering twice (loading + list) causes duplicate FLEET frames.
 		void this.autoDiscover();
 	}
 
@@ -195,7 +197,11 @@ export class FleetSelectorComponent extends Container implements Focusable {
 			});
 		}
 
-		this.applyFilter();
+		// Don't set filteredEntries or call rebuildChildren() here.
+		// The first render (from showOverlay) will show the loading screen
+		// (isLoading=true, children empty). After discovery completes,
+		// applyFilter() will render the full list once.
+		// This avoids duplicate FLEET frames.
 
 		try {
 			for await (const device of discoverStream({ probeTimeoutMs: 2000 })) {
@@ -205,7 +211,9 @@ export class FleetSelectorComponent extends Container implements Focusable {
 			// Discovery interrupted — keep what we have
 		}
 
+		// Now apply filter once with all entries (fleet + runtimes + discovered)
 		this.statusText = `Discovery complete · ${this.entries.length} members`;
+		this.clearLoading();
 		if (this.currentView === "main") {
 			this.applyFilter();
 		}
@@ -436,14 +444,21 @@ export class FleetSelectorComponent extends Container implements Focusable {
 
 		if (data === "r" && this.searchInput.getValue() === "") {
 			// r on cloud member (in fleet or available) → (re)configure via setup
-			const entry = this.filteredEntries[this.cursorIndex];
+			// Use filteredEntries if available, otherwise fall back to entries
+			// (filteredEntries may be empty during initial async loading)
+			const list = this.filteredEntries.length > 0 ? this.filteredEntries : this.entries;
+			const entry = list[this.cursorIndex];
 			if (entry && entry.isCloud) {
 				this.selectedEntry = entry;
 				void this.cloudAction("setup");
 				return;
 			}
-			// Otherwise → refresh
-			void this.autoDiscover();
+			// r on SSH/local → refresh (re-discover)
+			// But only if we have entries — don't trigger a second autoDiscover
+			// while the first one is still running
+			if (this.entries.length > 0 && !this.isLoading) {
+				void this.autoDiscover();
+			}
 			return;
 		}
 
@@ -792,7 +807,6 @@ export class FleetSelectorComponent extends Container implements Focusable {
 	private setLoading(text: string): void {
 		this.isLoading = true;
 		this.statusText = text;
-		this.rebuildChildren();
 	}
 
 	private clearLoading(): void {
