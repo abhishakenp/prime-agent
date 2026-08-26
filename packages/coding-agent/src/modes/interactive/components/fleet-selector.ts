@@ -129,6 +129,9 @@ export class FleetSelectorComponent extends Container implements Focusable {
 	private async autoDiscover(): Promise<void> {
 		this.setLoading("Discovering fleet members...");
 
+		// Clear previous entries to avoid duplicates on re-discovery
+		this.entries = [];
+
 		// Import runtime configs as fleet members (idempotent)
 		await importRuntimeMembers();
 
@@ -695,9 +698,17 @@ export class FleetSelectorComponent extends Container implements Focusable {
 	}> {
 		const { createInterface } = await import("node:readline");
 
-		// Suspend TUI — exit raw mode so readline and child processes work
+		// Suspend TUI — remove all stdin data listeners and exit raw mode
+		// so readline and child processes (wrangler login, gh auth login)
+		// get proper terminal I/O
 		const stdin = process.stdin;
 		const wasRaw = stdin.isTTY && stdin.isRaw;
+
+		// Save and remove all existing data listeners (TUI's input handler)
+		const originalListeners = stdin.listeners("data") as ((chunk: Buffer) => void)[];
+		stdin.removeAllListeners("data");
+		stdin.pause();
+
 		if (wasRaw) stdin.setRawMode(false);
 
 		// Clear screen artifacts, print separator
@@ -746,8 +757,13 @@ export class FleetSelectorComponent extends Container implements Focusable {
 			rl.close();
 			return result;
 		} finally {
-			// Restore TUI raw mode
+			// Restore TUI: re-attach listeners and raw mode
+			stdin.pause();
+			for (const listener of originalListeners) {
+				stdin.on("data", listener);
+			}
 			if (wasRaw) stdin.setRawMode(true);
+			stdin.resume();
 			// Re-render TUI
 			this.rebuildChildren();
 		}
