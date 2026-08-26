@@ -520,51 +520,8 @@ export async function setupGitHubActions(
 		return { success: false, message: "Could not get GitHub token. Run `gh auth login`." };
 	}
 
-	// 3. Check for existing repo in config
+	// 3. Fetch user's repos and show the picker (always — even if reconfiguring)
 	const existingRepo = newConfig.repo as string | undefined;
-	if (existingRepo) {
-		// Verify repo exists and user has write access
-		prompt.status(`Checking repo ${existingRepo}...`);
-		try {
-			const resp = execSync(`gh repo view ${existingRepo} --json name,visibility,viewerPermission`, {
-				encoding: "utf-8",
-				stdio: ["pipe", "pipe", "pipe"],
-			});
-			const info = JSON.parse(resp) as {
-				name: string;
-				visibility: string;
-				viewerPermission: string;
-			};
-			if (info.viewerPermission === "READ" || info.viewerPermission === "TRIAGE") {
-				const overwrite = await prompt.confirm(
-					`Repo ${existingRepo} is ${info.visibility} with ${info.viewerPermission} access. Use anyway?`,
-					false,
-				);
-				if (!overwrite) {
-					// Fall through to repo selection
-				} else {
-					newConfig.token = token;
-					return {
-						success: true,
-						message: `GitHub Actions runtime configured with repo: ${existingRepo}`,
-						config: newConfig,
-					};
-				}
-			} else {
-				newConfig.token = token;
-				return {
-					success: true,
-					message: `GitHub Actions runtime configured with repo: ${existingRepo} (${info.visibility})`,
-					config: newConfig,
-				};
-			}
-		} catch {
-			prompt.status(`Repo ${existingRepo} not accessible. Let's set up a new one.`);
-		}
-	}
-
-	// 4. Offer: create new repo, pick from existing repos, or enter name
-	// Fetch user's repos for the picker
 	let userRepos: { name: string; visibility: string; permission: string }[] = [];
 	try {
 		prompt.status("Fetching your GitHub repos...");
@@ -582,21 +539,24 @@ export async function setupGitHubActions(
 			})
 			.filter((r) => r.permission === "ADMIN" || r.permission === "WRITE" || r.permission === "MAINTAIN");
 	} catch {
-		// gh repo list failed — skip the picker, fall back to manual entry
+		// gh repo list failed — fall back to manual entry
 	}
 
 	const options = [
 		"Create a new public repo (unlimited Actions compute)",
 		"Create a new private repo (limited but hidden)",
 	];
-	const repoOffset = options.length; // index where repo list starts
+	const repoOffset = options.length;
 	for (const r of userRepos) {
-		options.push(`Use existing: ${r.name} (${r.visibility})`);
+		const isCurrent = r.name === existingRepo;
+		options.push(`Use existing: ${r.name} (${r.visibility})${isCurrent ? " — current" : ""}`);
 	}
 	options.push("Use an existing repo (enter name manually)");
 
 	const choice = await prompt.choose(
-		"GitHub Actions needs a dedicated repo for agent runs. What do you want to do?",
+		existingRepo
+			? `GitHub Actions repo (currently: ${existingRepo}). Pick or create a new one:`
+			: "GitHub Actions needs a dedicated repo for agent runs. What do you want to do?",
 		options,
 	);
 
