@@ -91,12 +91,36 @@ export class FleetSelectorComponent extends Container implements Focusable {
 	private cursorIndex = 0;
 	private statusText = "";
 	private isLoading = false;
+	private spinnerFrame = 0;
+	private spinnerTimer: ReturnType<typeof setInterval> | null = null;
 	private _renaming = false;
 	private _renameTarget = "";
 	private _tagging = false;
 	private _tagTarget = "";
 	private backgroundRefreshInProgress = false;
 	private readonly onDone: () => void;
+
+	private static readonly SPINNER_FRAMES = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+
+	private startSpinner(): void {
+		if (this.spinnerTimer) return;
+		this.spinnerFrame = 0;
+		this.spinnerTimer = setInterval(() => {
+			this.spinnerFrame = (this.spinnerFrame + 1) % FleetSelectorComponent.SPINNER_FRAMES.length;
+			this.rebuildChildren();
+		}, 80);
+	}
+
+	private stopSpinner(): void {
+		if (this.spinnerTimer) {
+			clearInterval(this.spinnerTimer);
+			this.spinnerTimer = null;
+		}
+	}
+
+	private getSpinner(): string {
+		return FleetSelectorComponent.SPINNER_FRAMES[this.spinnerFrame] ?? "⠋";
+	}
 	private readonly onCancel: () => void;
 	private readonly requestRender: () => void;
 	private readonly ui: TUI | undefined;
@@ -130,6 +154,7 @@ export class FleetSelectorComponent extends Container implements Focusable {
 	/** First load: fast config from disk, show immediately, then background network scan. */
 	private async initDiscovery(): Promise<void> {
 		this.setLoading("Loading fleet config...");
+		this.startSpinner();
 		this.entries = [];
 		await this.loadFleetConfig();
 		this.clearLoading();
@@ -138,6 +163,7 @@ export class FleetSelectorComponent extends Container implements Focusable {
 			this.applyFilter();
 		}
 		await this.discoverNetwork();
+		this.stopSpinner();
 		this.statusText = `${this.entries.length} members`;
 		if (this.currentView === "main") {
 			this.applyFilter();
@@ -229,12 +255,14 @@ export class FleetSelectorComponent extends Container implements Focusable {
 	private refreshInBackground(): void {
 		if (this.backgroundRefreshInProgress) return;
 		this.backgroundRefreshInProgress = true;
-		this.statusText = "Refreshing in background...";
+		this.statusText = "Scanning network for devices...";
+		this.startSpinner();
 		this.rebuildChildren();
 
 		void (async () => {
 			await this.loadFleetConfig();
 			await this.discoverNetwork();
+			this.stopSpinner();
 			this.backgroundRefreshInProgress = false;
 			this.statusText = `Refreshed · ${this.entries.length} members`;
 			if (this.currentView === "main") {
@@ -313,10 +341,14 @@ export class FleetSelectorComponent extends Container implements Focusable {
 			this.addChild(new Text(theme.fg("accent", `  ${this.statusText}`), 1, 0));
 			this.addChild(new Spacer(1));
 			this.addChild(new Text(theme.fg("dim", "  Type and press Enter · Esc to cancel"), 1, 0));
-		} else if (this.isLoading) {
-			this.addChild(new Text(theme.fg("dim", `  ${this.statusText}`), 1, 0));
+		} else if (this.isLoading || this.backgroundRefreshInProgress) {
+			this.addChild(new Text(theme.fg("accent", `  ${this.getSpinner()} ${this.statusText}`), 1, 0));
+		} else if (this.filteredEntries.length === 0 && this.searchInput.getValue().trim()) {
+			this.addChild(new Text(theme.fg("dim", `  No devices match "${this.searchInput.getValue().trim()}"`), 1, 0));
 		} else if (this.filteredEntries.length === 0) {
-			this.addChild(new Text(theme.fg("dim", "  No devices found"), 1, 0));
+			this.addChild(new Text(theme.fg("dim", "  No devices found on network"), 1, 0));
+			this.addChild(new Spacer(1));
+			this.addChild(new Text(theme.fg("dim", "  Press r to scan again · add runtimes with Enter"), 1, 0));
 		} else {
 			this.renderGroupedList();
 		}
@@ -462,6 +494,7 @@ export class FleetSelectorComponent extends Container implements Focusable {
 		}
 
 		if (data === "q" && this.searchInput.getValue() === "") {
+			this.stopSpinner();
 			this.onDone();
 			return;
 		}
@@ -518,6 +551,7 @@ export class FleetSelectorComponent extends Container implements Focusable {
 				this.applyFilter();
 				return;
 			}
+			this.stopSpinner();
 			this.onCancel();
 			return;
 		}
