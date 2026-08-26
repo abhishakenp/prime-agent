@@ -509,7 +509,6 @@ function buildSessionOptions(
 	hasExistingSession: boolean,
 	modelRegistry: ModelRegistry,
 	settingsManager: SettingsManager,
-	preferredProviders: Set<string>,
 ): {
 	options: CreateAgentSessionOptions;
 	cliThinkingFromModel: boolean;
@@ -527,7 +526,6 @@ function buildSessionOptions(
 			cliProvider: config.provider,
 			cliModel: config.model,
 			modelRegistry,
-			preferredProviders,
 		});
 		if (resolved.warning) {
 			diagnostics.push({ type: "warning", message: resolved.warning });
@@ -778,15 +776,6 @@ async function prepareRuntimeServices(options: {
 	const scopedModels =
 		modelPatterns && modelPatterns.length > 0 ? await resolveModelScope(modelPatterns, modelRegistry) : [];
 
-	// Build set of providers that have API keys — ask authStorage, no hardcoded mapping.
-	// Works for built-in providers, custom models.json providers, and future plugins.
-	const allProviders = new Set(modelRegistry.getAll().map((m) => m.provider));
-	const preferredProviders = new Set<string>();
-	for (const provider of allProviders) {
-		const key = await authStorage.getApiKey(provider);
-		if (key) preferredProviders.add(provider);
-	}
-
 	const {
 		options: sessionOptions,
 		cliThinkingFromModel,
@@ -797,7 +786,6 @@ async function prepareRuntimeServices(options: {
 		sessionManager.buildSessionContext().messages.length > 0,
 		modelRegistry,
 		settingsManager,
-		preferredProviders,
 	);
 	diagnostics.push(...sessionOptionDiagnostics);
 
