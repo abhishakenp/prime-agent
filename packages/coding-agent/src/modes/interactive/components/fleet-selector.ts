@@ -514,13 +514,7 @@ export class FleetSelectorComponent extends Container implements Focusable {
 			return;
 		}
 
-		// Cloud member with config → toggle active/inactive
-		if (entry.isCloud && entry.inFleet && entry.hasConfig) {
-			await this.toggleCloudMember(entry);
-			return;
-		}
-
-		// SSH host not in fleet → add to fleet
+		// Not in fleet → add to fleet
 		if (!entry.inFleet) {
 			const result = await addHostToFleet(entry.hostname, entry.address, entry.tags, entry.device);
 			this.statusText = result.success ? `✓ ${result.message}` : `✗ ${result.message}`;
@@ -528,21 +522,9 @@ export class FleetSelectorComponent extends Container implements Focusable {
 			return;
 		}
 
-		// SSH host in fleet → remove from fleet
+		// In fleet → remove from fleet
 		const removed = await removeFleetMember(entry.hostname);
 		this.statusText = removed ? `✓ Removed ${entry.hostname}` : `✗ Failed to remove`;
-		await this.autoDiscover();
-	}
-
-	private async toggleCloudMember(entry: FleetEntry): Promise<void> {
-		const { setFleetMemberEnabled, getFleetMember } = await import("../../../cli/fleet/fleet-config.js");
-		const member = await getFleetMember(entry.hostname);
-		if (!member) return;
-		const newEnabled = !member.enabled;
-		await setFleetMemberEnabled(entry.hostname, newEnabled);
-		entry.online = newEnabled;
-		this.statusText = newEnabled ? `✓ ${entry.hostname} active` : `○ ${entry.hostname} disabled`;
-		this.rebuildChildren();
 		await this.autoDiscover();
 	}
 
