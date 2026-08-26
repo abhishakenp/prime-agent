@@ -33,7 +33,11 @@ import {
 	removeFleetMember,
 } from "../../../cli/fleet/fleet-config.js";
 import { addHostToFleet, renameHostInFleet, tagHostInFleet } from "../../../cli/fleet/fleet-operations.js";
-import { installRuntimePlugin, listRuntimePlugins } from "../../../cli/fleet/runtime-operations.js";
+import {
+	installRuntimePlugin,
+	listRuntimePlugins,
+	runPluginSetupWithPath,
+} from "../../../cli/fleet/runtime-operations.js";
 import { theme } from "../theme/theme.js";
 import { DynamicBorder } from "./dynamic-border.js";
 import { shouldTreatAsBack } from "./modal-back.js";
@@ -625,9 +629,7 @@ export class FleetSelectorComponent extends Container implements Focusable {
 
 		this.setLoading(`Running ${transport} setup...`);
 		try {
-			const { runPluginSetupWithPath, savePluginConfig, pluginHasSetup } = await import(
-				"../../../cli/fleet/runtime-operations.js"
-			);
+			const { savePluginConfig, pluginHasSetup } = await import("../../../cli/fleet/runtime-operations.js");
 			const { userRuntimesDir, builtinRuntimesDir } = await import(
 				"../../../core/fleet-runtime/runtime-plugin-loader.js"
 			);
@@ -653,28 +655,10 @@ export class FleetSelectorComponent extends Container implements Focusable {
 				return;
 			}
 
-			// Run interactive setup (OAuth, repo creation, project selection, etc.)
-			const result = await runPluginSetupWithPath(pluginPath, {
-				ask: async (msg: string, defaultValue?: string) => {
-					this.statusText = `Setup: ${msg} → ${defaultValue ?? ""}`;
-					this.rebuildChildren();
-					return defaultValue ?? "";
-				},
-				confirm: async (msg: string, def?: boolean) => {
-					this.statusText = `Setup: ${msg} → ${def ?? true}`;
-					this.rebuildChildren();
-					return def ?? true;
-				},
-				choose: async (msg: string, options: string[]) => {
-					this.statusText = `Setup: ${msg} → ${options[0]}`;
-					this.rebuildChildren();
-					return 0;
-				},
-				status: (msg: string) => {
-					this.statusText = `Setup: ${msg}`;
-					this.rebuildChildren();
-				},
-			});
+			// Run interactive setup with real readline prompts
+			// Suspend TUI raw mode so readline + child processes (wrangler login,
+			// gh auth login) work with proper terminal I/O
+			const result = await this.runInteractiveSetup(pluginPath);
 
 			this.clearLoading();
 
@@ -694,6 +678,77 @@ export class FleetSelectorComponent extends Container implements Focusable {
 		} catch (err) {
 			this.clearLoading();
 			this.statusText = `✗ Setup failed: ${err instanceof Error ? err.message : String(err)}`;
+			this.rebuildChildren();
+		}
+	}
+
+	/**
+	 * Run plugin setup with real readline-based interactive prompts.
+	 * Suspends TUI raw mode so readline + child processes (wrangler login,
+	 * gh auth login --web) work with proper terminal I/O.
+	 * Restores TUI raw mode after setup completes.
+	 */
+	private async runInteractiveSetup(pluginPath: string): Promise<{
+		success: boolean;
+		message: string;
+		config?: Record<string, unknown>;
+	}> {
+		const { createInterface } = await import("node:readline");
+
+		// Suspend TUI — exit raw mode so readline and child processes work
+		const stdin = process.stdin;
+		const wasRaw = stdin.isTTY && stdin.isRaw;
+		if (wasRaw) stdin.setRawMode(false);
+
+		// Clear screen artifacts, print separator
+		process.stdout.write("\n\n");
+
+		const rl = createInterface({ input: stdin, output: process.stdout });
+
+		const prompt = {
+			ask: (q: string, def?: string): Promise<string | undefined> =>
+				new Promise((resolve) => {
+					const hint = def ? ` [${def}]: ` : ": ";
+					rl.question(`${q}${hint}`, (answer: string) => {
+						const trimmed = answer.trim();
+						if (!trimmed && def) return resolve(def);
+						resolve(trimmed || undefined);
+					});
+				}),
+			confirm: (q: string, def?: boolean): Promise<boolean> =>
+				new Promise((resolve) => {
+					const hint = def ? " [Y/n]: " : " [y/N]: ";
+					rl.question(`${q}${hint}`, (answer: string) => {
+						const a = answer.trim().toLowerCase();
+						if (!a) return resolve(def ?? false);
+						resolve(a === "y" || a === "yes");
+					});
+				}),
+			choose: (q: string, options: string[]): Promise<number> =>
+				new Promise((resolve) => {
+					console.log(`\n${q}`);
+					for (let i = 0; i < options.length; i++) {
+						console.log(`  ${i + 1}. ${options[i]}`);
+					}
+					rl.question(`Choose (1-${options.length}): `, (answer: string) => {
+						const n = Number.parseInt(answer.trim(), 10);
+						if (n >= 1 && n <= options.length) return resolve(n - 1);
+						resolve(-1);
+					});
+				}),
+			status: (msg: string) => {
+				console.log(`  ${msg}`);
+			},
+		};
+
+		try {
+			const result = await runPluginSetupWithPath(pluginPath, prompt);
+			rl.close();
+			return result;
+		} finally {
+			// Restore TUI raw mode
+			if (wasRaw) stdin.setRawMode(true);
+			// Re-render TUI
 			this.rebuildChildren();
 		}
 	}
