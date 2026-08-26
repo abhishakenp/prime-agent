@@ -189,17 +189,8 @@ export async function assembleBundle(spec: BundleSpec): Promise<string> {
 	const agentSettings = existsSync(settingsSrc) ? JSON.parse(readFileSync(settingsSrc, "utf-8")) : {};
 	if (spec.model) agentSettings.defaultModel = spec.model;
 	if (spec.provider) agentSettings.defaultProvider = spec.provider;
-	// Override settings with inferred provider if we detected one (see step 9)
-	// This prevents OpenRouter from being used when a direct provider key exists
-	if (spec.model?.startsWith("gemini-") && !spec.provider) {
-		agentSettings.defaultProvider = "google";
-	} else if (spec.model?.startsWith("deepseek") && !spec.provider) {
-		agentSettings.defaultProvider = "deepseek";
-	} else if (spec.model?.startsWith("claude") && !spec.provider) {
-		agentSettings.defaultProvider = "anthropic";
-	} else if (spec.model?.startsWith("gpt") && !spec.provider) {
-		agentSettings.defaultProvider = "openai";
-	}
+	// Don't hardcode a single provider — the run.sh tries all providers
+	// that have the model, in priority order (direct API first, aggregators last)
 	writeFileSync(join(agentDir, "settings.json"), JSON.stringify(agentSettings, null, 2), "utf-8");
 
 	// 6. Collect env vars (credentials + config)
@@ -291,22 +282,40 @@ export async function assembleBundle(spec: BundleSpec): Promise<string> {
 	const workDir = spec.workDir ?? `.prime/agent/sessions/fleet/${spec.identity.agentId}`;
 	const settingsPath = join(homedir(), ".prime", "agent", "settings.json");
 	const settings = existsSync(settingsPath) ? JSON.parse(readFileSync(settingsPath, "utf-8")) : {};
-	let provider = spec.provider ?? settings.defaultProvider ?? "";
+	const explicitProvider = spec.provider ?? settings.defaultProvider ?? "";
 	const model = spec.model ?? settings.defaultModel ?? "";
 
-	// Infer provider from model name when provider is OpenRouter (default) but
-	// a provider-specific model is supplied. This avoids routing Gemini models
-	// through OpenRouter (which charges credits) when a direct API key exists.
-	if ((!provider || provider === "openrouter") && model) {
-		if (model.startsWith("gemini-") || model.startsWith("gemma-")) provider = "google";
-		else if (model.startsWith("deepseek")) provider = "deepseek";
-		else if (model.startsWith("claude")) provider = "anthropic";
-		else if (model.startsWith("gpt")) provider = "openai";
+	// Build a provider priority list for the model.
+	// Direct API providers first (cheaper, no aggregator overhead),
+	// aggregators last (OpenRouter, etc. — work but cost credits).
+	// The run.sh tries each in order until one succeeds.
+	const providerPriority: string[] = [];
+	if (explicitProvider && explicitProvider !== "openrouter") {
+		providerPriority.push(explicitProvider);
+	}
+	if (model) {
+		// Add direct providers that likely have this model
+		if (model.startsWith("gemini-") || model.startsWith("gemma-")) {
+			if (!providerPriority.includes("google")) providerPriority.push("google");
+		}
+		if (model.startsWith("deepseek")) {
+			if (!providerPriority.includes("deepseek")) providerPriority.push("deepseek");
+		}
+		if (model.startsWith("claude")) {
+			if (!providerPriority.includes("anthropic")) providerPriority.push("anthropic");
+		}
+		if (model.startsWith("gpt")) {
+			if (!providerPriority.includes("openai")) providerPriority.push("openai");
+		}
+	}
+	// Aggregators as fallback — they have most models but cost credits
+	if (!providerPriority.includes("openrouter")) providerPriority.push("openrouter");
+	if (explicitProvider && !providerPriority.includes(explicitProvider)) {
+		providerPriority.push(explicitProvider);
 	}
 	const runScript = `#!/bin/bash
-set -e
-
 # AgentBundle entry point — self-contained, runs anywhere with Node.js
+# Note: no set -e — we want to try multiple providers and continue on failure
 BUNDLE_DIR="$(cd "$(dirname "$0")" && pwd)"
 
 # Load environment variables from env.json
@@ -334,18 +343,26 @@ if [ -d "$BUNDLE_DIR/files" ]; then
   cp -r "$BUNDLE_DIR/files/"* "$WORK_DIR/" 2>/dev/null || true
 fi
 
-# Run the agent in print mode (no daemon needed — print mode is self-contained)
-node "$BUNDLE_DIR/runtime/cli.js" \\
-  --print \\
-  --prompt "$(cat "$BUNDLE_DIR/agent/prompt.txt")" \\
-  --session-id "${spec.identity.agentId}" \\
-  --cwd "$WORK_DIR" \\
-  ${spec.identity.parentAgentId ? `--parent-agent-id ${spec.identity.parentAgentId}` : ""} \\
-  ${spec.identity.parentHost ? `--parent-host ${spec.identity.parentHost}` : ""} \\
-  ${provider ? `--provider ${provider}` : ""} \\
-  ${model ? `--model ${model}` : ""} \\
-  "$@"
-EXIT_CODE=$?
+# Run the agent in print mode — try each provider that has the model.
+# Direct API providers first (cheaper), aggregators last (fallback).
+# Stops at the first provider that succeeds.
+PROVIDERS="${providerPriority.join(" ")}"
+EXIT_CODE=1
+
+for PROVIDER in $PROVIDERS; do
+  echo "[agent] Trying provider: $PROVIDER"
+  node "$BUNDLE_DIR/runtime/cli.js" \\
+    --print \\
+    --prompt "$(cat "$BUNDLE_DIR/agent/prompt.txt")" \\
+    --session-id "${spec.identity.agentId}" \\
+    --cwd "$WORK_DIR" \\
+    --provider "$PROVIDER" \\
+    ${model ? `--model ${model}` : ""} \\
+    ${spec.identity.parentAgentId ? `--parent-agent-id ${spec.identity.parentAgentId}` : ""} \\
+    ${spec.identity.parentHost ? `--parent-host ${spec.identity.parentHost}` : ""} \\
+    "$@" && EXIT_CODE=0 && break
+  echo "[agent] Provider $PROVIDER failed, trying next..."
+done
 
 exit $EXIT_CODE
 `;
