@@ -165,11 +165,12 @@ export class FleetSelectorComponent extends Container implements Focusable {
 		}
 
 		// Add available runtime plugins (templates + removed user plugins)
+		// ssh is the core transport, not a cloud compute platform — skip it
 		const plugins = await listRuntimePlugins();
 		for (const p of plugins) {
 			if (addedTransports.has(p.name)) continue;
-			// Show templates and user/builtin plugins that aren't in the fleet
-			// (e.g. removed cloud members should still appear as available)
+			if (p.name === "ssh") continue; // core transport, not a compute platform
+			if (p.name === "example-custom") continue; // demo file, not a real runtime
 			this.entries.push({
 				hostname: p.name,
 				address: p.hasConfig ? "configured" : "not configured",
