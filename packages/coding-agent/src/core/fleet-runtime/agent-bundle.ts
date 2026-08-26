@@ -188,10 +188,18 @@ export async function assembleBundle(spec: BundleSpec): Promise<string> {
 	const settingsSrc = join(homedir(), ".prime", "agent", "settings.json");
 	const agentSettings = existsSync(settingsSrc) ? JSON.parse(readFileSync(settingsSrc, "utf-8")) : {};
 	if (spec.model) agentSettings.defaultModel = spec.model;
+	// Don't set defaultProvider — let the CLI find whatever provider has the model + a key.
+	// OmniRoute (if reachable) handles routing. On remote runners, the CLI auto-selects
+	// the first available provider that has the model and a valid API key in env.
 	if (spec.provider) agentSettings.defaultProvider = spec.provider;
-	// Don't hardcode a single provider — the run.sh tries all providers
-	// that have the model, in priority order (direct API first, aggregators last)
+	else delete agentSettings.defaultProvider;
 	writeFileSync(join(agentDir, "settings.json"), JSON.stringify(agentSettings, null, 2), "utf-8");
+
+	// 5b. Copy models.json (registers OmniRoute as a custom provider)
+	const modelsJsonSrc = join(homedir(), ".prime", "agent", "models.json");
+	if (existsSync(modelsJsonSrc)) {
+		copyFileSync(modelsJsonSrc, join(agentDir, "models.json"));
+	}
 
 	// 6. Collect env vars (credentials + config)
 	const envVars: Record<string, string> = {};
@@ -282,37 +290,15 @@ export async function assembleBundle(spec: BundleSpec): Promise<string> {
 	const workDir = spec.workDir ?? `.prime/agent/sessions/fleet/${spec.identity.agentId}`;
 	const settingsPath = join(homedir(), ".prime", "agent", "settings.json");
 	const settings = existsSync(settingsPath) ? JSON.parse(readFileSync(settingsPath, "utf-8")) : {};
-	const explicitProvider = spec.provider ?? settings.defaultProvider ?? "";
 	const model = spec.model ?? settings.defaultModel ?? "";
 
-	// Build a provider priority list for the model.
-	// Direct API providers first (cheaper, no aggregator overhead),
-	// aggregators last (OpenRouter, etc. — work but cost credits).
-	// The run.sh tries each in order until one succeeds.
-	const providerPriority: string[] = [];
-	if (explicitProvider && explicitProvider !== "openrouter") {
-		providerPriority.push(explicitProvider);
-	}
-	if (model) {
-		// Add direct providers that likely have this model
-		if (model.startsWith("gemini-") || model.startsWith("gemma-")) {
-			if (!providerPriority.includes("google")) providerPriority.push("google");
-		}
-		if (model.startsWith("deepseek")) {
-			if (!providerPriority.includes("deepseek")) providerPriority.push("deepseek");
-		}
-		if (model.startsWith("claude")) {
-			if (!providerPriority.includes("anthropic")) providerPriority.push("anthropic");
-		}
-		if (model.startsWith("gpt")) {
-			if (!providerPriority.includes("openai")) providerPriority.push("openai");
-		}
-	}
-	// Aggregators as fallback — they have most models but cost credits
-	if (!providerPriority.includes("openrouter")) providerPriority.push("openrouter");
-	if (explicitProvider && !providerPriority.includes(explicitProvider)) {
-		providerPriority.push(explicitProvider);
-	}
+	// OmniRoute is the primary router when available.
+	// It handles: multi-provider failover, key rotation, combo routing,
+	// free-model discovery, and the provisioner auto-adds keys to it.
+	// The bundle's models.json registers OmniRoute as a custom provider.
+	// If OmniRoute is down, fall back to the explicit/default provider.
+	// No hardcoded provider prefixes — OmniRoute routes, we just point at it.
+	const omnirouteUrl = process.env.OMNIROUTE_URL ?? "http://localhost:20128";
 	const runScript = `#!/bin/bash
 # AgentBundle entry point — self-contained, runs anywhere with Node.js
 # Note: no set -e — we want to try multiple providers and continue on failure
@@ -343,26 +329,45 @@ if [ -d "$BUNDLE_DIR/files" ]; then
   cp -r "$BUNDLE_DIR/files/"* "$WORK_DIR/" 2>/dev/null || true
 fi
 
-# Run the agent in print mode — try each provider that has the model.
-# Direct API providers first (cheaper), aggregators last (fallback).
-# Stops at the first provider that succeeds.
-PROVIDERS="${providerPriority.join(" ")}"
+# Run the agent in print mode.
+# OmniRoute is the primary router — it handles multi-provider failover,
+# key rotation, combo routing, and free-model discovery.
+# The provisioner auto-adds keys to OmniRoute; OmniRoute routes across them.
+# If OmniRoute is unreachable, fall back to the explicit/default provider.
+OMNIROUTE_URL="${omnirouteUrl}"
+# Point the CLI at the bundle's agent dir so it finds models.json (OmniRoute provider)
+export PI_CODING_AGENT_DIR="$BUNDLE_DIR/agent"
 EXIT_CODE=1
 
-for PROVIDER in $PROVIDERS; do
-  echo "[agent] Trying provider: $PROVIDER"
+# Check if OmniRoute is alive (2s timeout)
+if curl -s --max-time 2 "$OMNIROUTE_URL/" >/dev/null 2>&1; then
+  echo "[agent] Using OmniRoute at $OMNIROUTE_URL"
   node "$BUNDLE_DIR/runtime/cli.js" \\
     --print \\
     --prompt "$(cat "$BUNDLE_DIR/agent/prompt.txt")" \\
     --session-id "${spec.identity.agentId}" \\
     --cwd "$WORK_DIR" \\
-    --provider "$PROVIDER" \\
+    --provider omniroute \\
+    ${model ? `--model ${model}` : "--model auto/best-free"} \\
+    ${spec.identity.parentAgentId ? `--parent-agent-id ${spec.identity.parentAgentId}` : ""} \\
+    ${spec.identity.parentHost ? `--parent-host ${spec.identity.parentHost}` : ""} \\
+    "$@" && EXIT_CODE=0
+fi
+
+# Fallback: no OmniRoute — let the CLI auto-select whatever provider has the model + a key.
+# The bundle carries all API keys in env.json, so the CLI can try google, deepseek, openrouter, etc.
+if [ $EXIT_CODE -ne 0 ]; then
+  echo "[agent] OmniRoute unavailable, auto-selecting provider with available key"
+  node "$BUNDLE_DIR/runtime/cli.js" \\
+    --print \\
+    --prompt "$(cat "$BUNDLE_DIR/agent/prompt.txt")" \\
+    --session-id "${spec.identity.agentId}" \\
+    --cwd "$WORK_DIR" \\
     ${model ? `--model ${model}` : ""} \\
     ${spec.identity.parentAgentId ? `--parent-agent-id ${spec.identity.parentAgentId}` : ""} \\
     ${spec.identity.parentHost ? `--parent-host ${spec.identity.parentHost}` : ""} \\
-    "$@" && EXIT_CODE=0 && break
-  echo "[agent] Provider $PROVIDER failed, trying next..."
-done
+    "$@" && EXIT_CODE=0
+fi
 
 exit $EXIT_CODE
 `;

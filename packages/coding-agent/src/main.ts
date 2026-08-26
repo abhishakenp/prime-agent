@@ -522,10 +522,39 @@ function buildSessionOptions(
 	// - supports --provider <name> --model <pattern>
 	// - supports --model <provider>/<pattern>
 	if (config.model) {
+		// Build set of providers with API keys in env (for preferring in exact match)
+		const preferredProviders = new Set<string>();
+		const envKeyMap: Record<string, string> = {
+			google: "GEMINI_API_KEY",
+			anthropic: "ANTHROPIC_API_KEY",
+			openai: "OPENAI_API_KEY",
+			deepseek: "DEEPSEEK_API_KEY",
+			openrouter: "OPENROUTER_API_KEY",
+			groq: "GROQ_API_KEY",
+			mistral: "MISTRAL_API_KEY",
+			cohere: "COHERE_API_KEY",
+			xai: "XAI_API_KEY",
+			huggingface: "HF_TOKEN",
+			fireworks: "FIREWORKS_API_KEY",
+			cerebras: "CEREBRAS_API_KEY",
+			zai: "ZAI_API_KEY",
+			minimax: "MINIMAX_API_KEY",
+			moonshotai: "MOONSHOT_API_KEY",
+			xiaomi: "MIMO_API_KEY",
+			opencode: "OPENCODE_API_KEY",
+			"azure-openai-responses": "AZURE_OPENAI_API_KEY",
+			"amazon-bedrock": "AWS_ACCESS_KEY_ID",
+			"google-vertex": "GOOGLE_VERTEX_API_KEY",
+			"github-copilot": "GITHUB_COPILOT_TOKEN",
+		};
+		for (const [provider, envKey] of Object.entries(envKeyMap)) {
+			if (process.env[envKey]) preferredProviders.add(provider);
+		}
 		const resolved = resolveCliModel({
 			cliProvider: config.provider,
 			cliModel: config.model,
 			modelRegistry,
+			preferredProviders,
 		});
 		if (resolved.warning) {
 			diagnostics.push({ type: "warning", message: resolved.warning });

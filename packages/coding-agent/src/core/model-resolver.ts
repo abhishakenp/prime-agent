@@ -346,8 +346,10 @@ export function resolveCliModel(options: {
 	cliProvider?: string;
 	cliModel?: string;
 	modelRegistry: ModelRegistry;
+	/** Providers known to have API keys — exact match prefers these */
+	preferredProviders?: Set<string>;
 }): ResolveCliModelResult {
-	const { cliProvider, cliModel, modelRegistry } = options;
+	const { cliProvider, cliModel, modelRegistry, preferredProviders } = options;
 
 	if (!cliModel) {
 		return { model: undefined, warning: undefined, error: undefined };
@@ -402,10 +404,13 @@ export function resolveCliModel(options: {
 	// This handles models whose IDs naturally contain slashes (e.g. OpenRouter-style IDs).
 	if (!provider) {
 		const lower = cliModel.toLowerCase();
-		const exact = availableModels.find(
+		const exactMatches = availableModels.filter(
 			(m) => m.id.toLowerCase() === lower || `${m.provider}/${m.id}`.toLowerCase() === lower,
 		);
-		if (exact) {
+		if (exactMatches.length > 0) {
+			// Prefer providers with API keys when available
+			const withKey = preferredProviders ? exactMatches.find((m) => preferredProviders.has(m.provider)) : undefined;
+			const exact = withKey ?? exactMatches[0]!;
 			return { model: exact, warning: undefined, thinkingLevel: undefined, error: undefined };
 		}
 	}
