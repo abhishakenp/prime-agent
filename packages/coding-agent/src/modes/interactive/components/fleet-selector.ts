@@ -95,6 +95,7 @@ export class FleetSelectorComponent extends Container implements Focusable {
 	private _renameTarget = "";
 	private _tagging = false;
 	private _tagTarget = "";
+	private backgroundRefreshInProgress = false;
 	private readonly onDone: () => void;
 	private readonly onCancel: () => void;
 	private readonly requestRender: () => void;
@@ -120,39 +121,46 @@ export class FleetSelectorComponent extends Container implements Focusable {
 
 		this.searchInput = new Input();
 		this.isLoading = true;
-		this.statusText = "Discovering networked devices...";
+		this.statusText = "Loading fleet...";
 
-		// Render the loading screen once, then autoDiscover() will
-		// render the full list when ready.
 		this.rebuildChildren();
-		void this.autoDiscover();
+		void this.initDiscovery();
+	}
+
+	/** First load: fast config from disk, show immediately, then background network scan. */
+	private async initDiscovery(): Promise<void> {
+		this.setLoading("Loading fleet config...");
+		this.entries = [];
+		await this.loadFleetConfig();
+		this.clearLoading();
+		this.statusText = `${this.entries.length} members · scanning network...`;
+		if (this.currentView === "main") {
+			this.applyFilter();
+		}
+		await this.discoverNetwork();
+		this.statusText = `${this.entries.length} members`;
+		if (this.currentView === "main") {
+			this.applyFilter();
+		}
 	}
 
 	getSearchInput(): Input {
 		return this.searchInput;
 	}
 
-	// ─── Auto-discover — single streaming pipeline ───────────────────
+	// ─── Discovery: fast config load + background network scan ───────
 
-	private async autoDiscover(): Promise<void> {
-		this.setLoading("Discovering fleet members...");
-
-		// Clear previous entries to avoid duplicates on re-discovery
-		this.entries = [];
-
-		// Import runtime configs as fleet members (idempotent)
+	/** Fast: load fleet config + runtime plugins from disk (no network). */
+	private async loadFleetConfig(): Promise<void> {
 		await importRuntimeMembers();
 
-		// Load SSH hosts (legacy, still works)
 		const fleetHosts = await listFleetHosts();
-		this.clearLoading();
 		this.entries = mergeHostsAndDevices(fleetHosts, []);
 
-		// Load cloud members (cloudflare, github-actions, custom)
 		const members = await listFleetMembers();
 		const addedTransports = new Set<string>();
 		for (const m of members) {
-			if (m.transport === "ssh") continue; // Already in fleetHosts
+			if (m.transport === "ssh") continue;
 			addedTransports.add(m.transport);
 			const existing = this.entries.find((e) => e.hostname === m.name);
 			if (existing) {
@@ -179,13 +187,11 @@ export class FleetSelectorComponent extends Container implements Focusable {
 			}
 		}
 
-		// Add available runtime plugins (templates + removed user plugins)
-		// ssh is the core transport, not a cloud compute platform — skip it
 		const plugins = await listRuntimePlugins();
 		for (const p of plugins) {
 			if (addedTransports.has(p.name)) continue;
-			if (p.name === "ssh") continue; // core transport, not a compute platform
-			if (p.name === "example-custom") continue; // demo file, not a real runtime
+			if (p.name === "ssh") continue;
+			if (p.name === "example-custom") continue;
 			this.entries.push({
 				hostname: p.name,
 				address: p.hasConfig ? "configured" : "not configured",
@@ -202,17 +208,11 @@ export class FleetSelectorComponent extends Container implements Focusable {
 				config: p.config,
 			});
 		}
+	}
 
-		// Don't set filteredEntries or call rebuildChildren() here.
-		// The first render (from showOverlay) will show the loading screen
-		// (isLoading=true, children empty). After discovery completes,
-		// applyFilter() will render the full list once.
-		// This avoids duplicate FLEET frames.
-
+	/** Slow: scan network for devices. Merges into entries live. */
+	private async discoverNetwork(): Promise<void> {
 		try {
-			// discoverStream can hang indefinitely if a source (Tailscale,
-			// multicast, etc.) never yields and never completes. Race it
-			// against a timeout — whatever devices we've found so far, keep.
 			const DISCOVERY_TIMEOUT_MS = 8000;
 			const discoveryPromise = (async () => {
 				for await (const device of discoverStream({ probeTimeoutMs: 2000 })) {
@@ -223,13 +223,24 @@ export class FleetSelectorComponent extends Container implements Focusable {
 		} catch {
 			// Discovery interrupted — keep what we have
 		}
+	}
 
-		// Now apply filter once with all entries (fleet + runtimes + discovered)
-		this.statusText = `Discovery complete · ${this.entries.length} members`;
-		this.clearLoading();
-		if (this.currentView === "main") {
-			this.applyFilter();
-		}
+	/** Background refresh: re-scan network without blocking UI. */
+	private refreshInBackground(): void {
+		if (this.backgroundRefreshInProgress) return;
+		this.backgroundRefreshInProgress = true;
+		this.statusText = "Refreshing in background...";
+		this.rebuildChildren();
+
+		void (async () => {
+			await this.loadFleetConfig();
+			await this.discoverNetwork();
+			this.backgroundRefreshInProgress = false;
+			this.statusText = `Refreshed · ${this.entries.length} members`;
+			if (this.currentView === "main") {
+				this.applyFilter();
+			}
+		})();
 	}
 
 	private mergeDevice(device: DiscoveredDevice): void {
@@ -456,9 +467,6 @@ export class FleetSelectorComponent extends Container implements Focusable {
 		}
 
 		if (data === "r" && this.searchInput.getValue() === "") {
-			// r on cloud member (in fleet or available) → (re)configure via setup
-			// Use filteredEntries if available, otherwise fall back to entries
-			// (filteredEntries may be empty during initial async loading)
 			const list = this.filteredEntries.length > 0 ? this.filteredEntries : this.entries;
 			const entry = list[this.cursorIndex];
 			if (entry && entry.isCloud) {
@@ -466,11 +474,8 @@ export class FleetSelectorComponent extends Container implements Focusable {
 				void this.cloudAction("setup");
 				return;
 			}
-			// r on SSH/local → refresh (re-discover)
-			// But only if we have entries — don't trigger a second autoDiscover
-			// while the first one is still running
-			if (this.entries.length > 0 && !this.isLoading) {
-				void this.autoDiscover();
+			if (this.entries.length > 0 && !this.isLoading && !this.backgroundRefreshInProgress) {
+				this.refreshInBackground();
 			}
 			return;
 		}
@@ -564,14 +569,22 @@ export class FleetSelectorComponent extends Container implements Focusable {
 		if (!entry.inFleet) {
 			const result = await addHostToFleet(entry.hostname, entry.address, entry.tags, entry.device);
 			this.statusText = result.success ? `✓ ${result.message}` : `✗ ${result.message}`;
-			await this.autoDiscover();
+			if (result.success) {
+				entry.inFleet = true;
+				entry.isTemplate = false;
+			}
+			this.applyFilter();
 			return;
 		}
 
 		// In fleet → remove from fleet
 		const removed = await removeFleetMember(entry.hostname);
 		this.statusText = removed ? `✓ Removed ${entry.hostname}` : `✗ Failed to remove`;
-		await this.autoDiscover();
+		if (removed) {
+			entry.inFleet = false;
+			if (entry.isCloud) entry.isTemplate = true;
+		}
+		this.applyFilter();
 	}
 
 	private async reAddRuntime(entry: FleetEntry): Promise<void> {
@@ -587,7 +600,9 @@ export class FleetSelectorComponent extends Container implements Focusable {
 			config: entry.config,
 		});
 		this.statusText = `✓ Re-added ${transport}`;
-		await this.autoDiscover();
+		entry.inFleet = true;
+		entry.isTemplate = false;
+		this.applyFilter();
 	}
 
 	private async addAndSetupRuntime(entry: FleetEntry): Promise<void> {
@@ -618,10 +633,10 @@ export class FleetSelectorComponent extends Container implements Focusable {
 
 		// Auto-run setup
 		this.selectedEntry = { ...entry, inFleet: true, isTemplate: false };
+		entry.inFleet = true;
+		entry.isTemplate = false;
+		this.applyFilter();
 		await this.cloudAction("setup");
-
-		// Refresh list
-		await this.autoDiscover();
 	}
 
 	private async confirmRename(newName: string): Promise<void> {
@@ -632,7 +647,14 @@ export class FleetSelectorComponent extends Container implements Focusable {
 		this.statusText = result.success ? `✓ ${result.message}` : `✗ ${result.message}`;
 		this.currentView = "main";
 		this.selectedEntry = null;
-		await this.autoDiscover();
+		if (result.success) {
+			const entry = this.entries.find((e) => e.hostname === hostname);
+			if (entry) {
+				if (entry.fleetHost) entry.fleetHost.displayName = newName;
+				else entry.fleetHost = { hostname, displayName: newName } as FleetHost;
+			}
+		}
+		this.applyFilter();
 	}
 
 	private async confirmTag(tag: string): Promise<void> {
@@ -643,7 +665,11 @@ export class FleetSelectorComponent extends Container implements Focusable {
 		this.statusText = result.success ? `✓ ${result.message}` : `✗ ${result.message}`;
 		this.currentView = "main";
 		this.selectedEntry = null;
-		await this.autoDiscover();
+		if (result.success) {
+			const entry = this.entries.find((e) => e.hostname === hostname);
+			if (entry && !entry.tags.includes(tag)) entry.tags.push(tag);
+		}
+		this.applyFilter();
 	}
 
 	// ─── Actions — all delegate to fleet-operations.ts ────────────────
