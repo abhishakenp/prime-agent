@@ -15,7 +15,7 @@ import { execSync, spawn } from "node:child_process";
 import { existsSync, mkdirSync, readFileSync, realpathSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
-import { type AgentIdentitySpec, assembleBundle, type BundleSpec } from "./agent-bundle.js";
+import { type AgentIdentitySpec, assembleBundle, type BundleSpec } from "../../core/fleet-runtime/agent-bundle.js";
 import type {
 	AgentEvent,
 	AgentIdentity,
@@ -25,7 +25,7 @@ import type {
 	AgentStatusInfo,
 	SpawnRequest,
 	SpawnResult,
-} from "./agent-runtime.js";
+} from "../../core/fleet-runtime/agent-runtime.js";
 
 export interface CloudflareRuntimeConfig {
 	apiToken?: string;

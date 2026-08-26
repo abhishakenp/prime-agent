@@ -14,7 +14,12 @@
 import { execSync, spawn } from "node:child_process";
 import { mkdirSync, readdirSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
-import { type AgentIdentitySpec, assembleBundle, type BundleSpec, tarBundle } from "./agent-bundle.js";
+import {
+	type AgentIdentitySpec,
+	assembleBundle,
+	type BundleSpec,
+	tarBundle,
+} from "../../core/fleet-runtime/agent-bundle.js";
 import type {
 	AgentEvent,
 	AgentIdentity,
@@ -24,7 +29,7 @@ import type {
 	AgentStatusInfo,
 	SpawnRequest,
 	SpawnResult,
-} from "./agent-runtime.js";
+} from "../../core/fleet-runtime/agent-runtime.js";
 
 export interface GitHubActionsRuntimeConfig {
 	token?: string;
@@ -255,6 +260,12 @@ export class GitHubActionsRuntime implements AgentRuntime {
 
 		lines.push(
 			"",
+			"      - name: Find Work Directory",
+			"        if: always()",
+			"        id: workdir",
+			"        run: |",
+			`          echo "work_path=$HOME/${workDir}" >> $GITHUB_OUTPUT`,
+			"",
 			"      - name: Upload Work Directory",
 			"        if: always()",
 			"        uses: actions/upload-artifact@v4",
@@ -262,7 +273,7 @@ export class GitHubActionsRuntime implements AgentRuntime {
 			// biome-ignore lint/suspicious/noTemplateCurlyInString: GitHub Actions syntax
 			"          name: agent-work-${{ github.run_id }}",
 			// biome-ignore lint/suspicious/noTemplateCurlyInString: GitHub Actions syntax
-			"          path: ${{ format('{0}/{1}', env.HOME, github.event.inputs.work_dir) }}/",
+			"          path: ${{ steps.workdir.outputs.work_path }}/",
 			"          if-no-files-found: ignore",
 			"",
 			"      - name: Upload Agent Logs",
