@@ -683,9 +683,71 @@ export async function setupCloudflare(
 		}
 	}
 
+	// 5. List existing Workers and offer: create new, pick existing, or skip
+	if (!newConfig.workerName) {
+		prompt.status("Fetching your Cloudflare Workers...");
+		let workerNames: string[] = [];
+		try {
+			const wranglerConfigPath = join(homedir(), "Library", "Preferences", ".wrangler", "config", "default.toml");
+			let apiToken = newConfig.apiToken as string | undefined;
+
+			// If no API token, try wrangler's OAuth token
+			if (!apiToken) {
+				try {
+					const configContent = readFileSync(wranglerConfigPath, "utf-8");
+					const tokenMatch = configContent.match(/oauth_token\s*=\s*"([^"]+)"/);
+					if (tokenMatch) apiToken = tokenMatch[1];
+				} catch {}
+			}
+
+			if (apiToken && accountId) {
+				const apiUrl = `https://api.cloudflare.com/client/v4/accounts/${accountId}/workers/scripts`;
+				const response = await fetch(apiUrl, {
+					headers: { Authorization: `Bearer ${apiToken}` },
+				});
+				if (response.ok) {
+					const data = (await response.json()) as {
+						success: boolean;
+						result?: { id: string; modified_on?: string }[];
+					};
+					if (data.success && data.result) {
+						workerNames = data.result.map((w) => w.id);
+					}
+				}
+			}
+		} catch {
+			// API call failed — skip worker listing
+		}
+
+		const options = ["Create a new Worker (default name: prime-agent-gateway)"];
+		const workerOffset = options.length;
+		for (const name of workerNames) {
+			options.push(`Use existing Worker: ${name}`);
+		}
+		options.push("Skip (configure Worker name later)");
+
+		const choice = await prompt.choose(
+			"Cloudflare runtime needs a Worker for the agent gateway. What do you want to do?",
+			options,
+		);
+
+		if (choice === 0) {
+			// Create new Worker
+			const workerName = await prompt.ask("Worker name:", "prime-agent-gateway");
+			if (workerName) {
+				newConfig.workerName = workerName;
+			}
+		} else if (choice >= workerOffset && choice < workerOffset + workerNames.length) {
+			// Pick existing Worker
+			newConfig.workerName = workerNames[choice - workerOffset];
+		}
+		// choice === last → skip, don't set workerName
+	}
+
 	const parts: string[] = [];
 	if (accountId) parts.push(`account: ${accountId}`);
 	if (newConfig.workersSubdomain) parts.push(`subdomain: ${newConfig.workersSubdomain}`);
+	if (newConfig.workerName) parts.push(`worker: ${newConfig.workerName}`);
 	if (newConfig.apiToken) parts.push("API token set");
 
 	return {
