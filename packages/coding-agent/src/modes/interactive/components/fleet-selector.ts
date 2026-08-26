@@ -435,9 +435,9 @@ export class FleetSelectorComponent extends Container implements Focusable {
 		}
 
 		if (data === "r" && this.searchInput.getValue() === "") {
-			// r on active cloud member → reconfigure (run setup)
+			// r on cloud member (in fleet or available) → (re)configure via setup
 			const entry = this.filteredEntries[this.cursorIndex];
-			if (entry && entry.isCloud && entry.inFleet && entry.hasConfig) {
+			if (entry && entry.isCloud) {
 				this.selectedEntry = entry;
 				void this.cloudAction("setup");
 				return;
@@ -648,7 +648,8 @@ export class FleetSelectorComponent extends Container implements Focusable {
 				return;
 			}
 
-			if (!pluginHasSetup(pluginPath)) {
+			const hasSetup = await pluginHasSetup(pluginPath);
+			if (!hasSetup) {
 				this.clearLoading();
 				this.statusText = `✗ ${transport} has no setup flow`;
 				this.rebuildChildren();
